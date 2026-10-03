@@ -1,0 +1,124 @@
+{
+  "$comment": "The agent registry: which coding agents exist, how each marks the processes it starts, what its MCP client calls itself, and who makes it. Read by @coldread/agents (detect.ts) and the Python SDK (packages/python/src/coldread/registry.json, a copy tests hold equal). Rules are in precedence order: first match wins.",
+  "aliases": {
+    "claude-code-cli": "claude-code",
+    "claudecode": "claude-code",
+    "codex-cli": "codex",
+    "openai-codex": "codex",
+    "gemini": "gemini-cli",
+    "geminicli": "gemini-cli",
+    "cursor-agent": "cursor",
+    "cursor-cli": "cursor",
+    "augment-agent": "augment",
+    "auggie": "augment",
+    "roo-code": "roo",
+    "roocode": "roo",
+    "roo-cline": "roo",
+    "github-copilot": "copilot",
+    "copilot-cli": "copilot",
+    "github-copilot-cli": "copilot",
+    "open-code": "opencode"
+  },
+  "vendors": {
+    "claude-code": "Anthropic",
+    "claude": "Anthropic",
+    "codex": "OpenAI",
+    "chatgpt": "OpenAI",
+    "gemini-cli": "Google",
+    "cursor": "Anysphere",
+    "augment": "Augment Code",
+    "goose": "Block",
+    "opencode": "SST",
+    "cline": "Cline",
+    "roo": "Roo Code",
+    "kiro": "Amazon",
+    "copilot": "GitHub",
+    "vscode": "Microsoft",
+    "aider": "Aider",
+    "windsurf": "Cognition",
+    "zed": "Zed Industries",
+    "continue": "Continue",
+    "amp": "Sourcegraph",
+    "mcp-inspector": "Anthropic"
+  },
+  "mcpClients": {
+    "claude-ai": "claude",
+    "claude desktop": "claude",
+    "codex-mcp-client": "codex",
+    "gemini-cli-mcp-client": "gemini-cli",
+    "cursor-vscode": "cursor",
+    "visual studio code": "vscode",
+    "visual studio code - insiders": "vscode",
+    "windsurf-client": "windsurf",
+    "continue-client": "continue",
+    "inspector-client": "mcp-inspector",
+    "mcp-inspector": "mcp-inspector",
+    "openai-mcp": "chatgpt",
+    "roo code": "roo"
+  },
+  "devTools": ["mcp-inspector"],
+  "rules": [
+    {
+      "name": "claude-code",
+      "markers": [
+        { "env": "CLAUDE_CODE_CHILD_SESSION", "when": "true", "confidence": "high", "note": "Set only on commands Claude Code itself spawns (v2.1.172+)." },
+        { "env": "CLAUDECODE", "when": "no-tty", "confidence": "medium", "note": "Also inherited by IDE terminals, tmux and MCP stdio servers." }
+      ],
+      "versionFromAgentId": "AI_AGENT",
+      "host": {
+        "env": "CLAUDE_CODE_ENTRYPOINT",
+        "exact": { "cli": "terminal", "claude-desktop": "desktop", "claude-vscode": "vscode" },
+        "prefix": { "sdk": "sdk", "remote": "remote" }
+      },
+      "session": ["CLAUDE_CODE_SESSION_ID"],
+      "signals": ["CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT"]
+    },
+    {
+      "name": "codex",
+      "markers": [
+        { "env": "CODEX_THREAD_ID", "when": "set", "confidence": "high" },
+        { "env": "CODEX_SESSION_ID", "when": "set", "confidence": "high" },
+        { "env": "CODEX_CI", "when": "true", "confidence": "high" },
+        { "env": "CODEX_SANDBOX_NETWORK_DISABLED", "when": "true", "confidence": "high" }
+      ],
+      "versionEnv": "CODEX_VERSION",
+      "session": ["CODEX_THREAD_ID", "CODEX_SESSION_ID"],
+      "signals": ["CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_VERSION", "CODEX_CI", "CODEX_SANDBOX_NETWORK_DISABLED"]
+    },
+    { "name": "gemini-cli", "markers": [{ "env": "GEMINI_CLI", "when": "true", "confidence": "high", "note": "Gemini CLI runs commands under a real PTY, so a TTY doesn't rule it out." }] },
+    {
+      "name": "cursor",
+      "markers": [
+        { "env": "CURSOR_AGENT", "when": "set", "confidence": "high" },
+        { "env": "CURSOR_TRACE_ID", "when": "no-tty", "confidence": "low", "note": "Also in people's Cursor terminals." }
+      ]
+    },
+    { "name": "augment", "markers": [{ "env": "AUGMENT_AGENT", "when": "true", "confidence": "high" }] },
+    {
+      "name": "goose",
+      "markers": [
+        { "env": "GOOSE_TERMINAL", "when": "true", "confidence": "high" },
+        { "env": "AGENT", "when": "equals", "value": "goose", "confidence": "high" }
+      ]
+    },
+    { "name": "opencode", "markers": [{ "env": "OPENCODE", "when": "true", "confidence": "high" }] },
+    { "name": "cline", "markers": [{ "env": "CLINE_ACTIVE", "when": "true", "confidence": "medium" }] },
+    { "name": "roo", "markers": [{ "env": "ROO_ACTIVE", "when": "true", "confidence": "medium" }] },
+    { "name": "kiro", "markers": [{ "env": "TERM_PROGRAM", "when": "equals", "value": "kiro", "confidence": "medium" }] }
+  ],
+  "genericEnv": ["AI_AGENT", "AGENT"],
+  "processNames": [
+    { "pattern": "^claude$", "agent": "claude-code" },
+    { "pattern": "^codex$", "agent": "codex" },
+    { "pattern": "^gemini$", "agent": "gemini-cli" },
+    { "pattern": "^cursor-agent$", "agent": "cursor" },
+    { "pattern": "^copilot$", "agent": "copilot" },
+    { "pattern": "^aider$", "agent": "aider" },
+    { "pattern": "^windsurf$", "flags": "i", "agent": "windsurf" },
+    { "pattern": "^goose$", "agent": "goose" },
+    { "pattern": "^opencode$", "agent": "opencode" },
+    { "pattern": "^kiro(-cli)?$", "flags": "i", "agent": "kiro" },
+    { "pattern": "^amp$", "agent": "amp" }
+  ],
+  "ciVars": ["CI", "CONTINUOUS_INTEGRATION", "BUILD_NUMBER", "RUN_ID", "GITHUB_ACTIONS", "GITLAB_CI", "CIRCLECI", "TRAVIS", "BUILDKITE", "JENKINS_URL", "TEAMCITY_VERSION", "TF_BUILD", "BITBUCKET_BUILD_NUMBER", "CODEBUILD_BUILD_ID", "DRONE", "VERCEL", "NETLIFY", "RENDER"]
+}
