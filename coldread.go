@@ -1,5 +1,15 @@
-// Package coldread shows which AI agents run your Go CLI, and for which
-// commands. The Go counterpart of @coldread/cli: the same events, the same
+// Package coldread shows which AI agents use your Go website or API, CLI
+// and MCP server. Three parts:
+//
+//   - NewTracker: net/http middleware for websites and APIs, the Go
+//     counterpart of @coldread/track (secret key, COLDREAD_KEY).
+//   - NewMCP: an MCP server's tool calls, the counterpart of
+//     @coldread/cli/mcp, fed by the crmcp (official SDK) and crmcpgo
+//     (mcp-go) helpers (public key).
+//   - New: a CLI's runs, the counterpart of @coldread/cli (public key),
+//     below.
+//
+// The CLI half sends the same events as @coldread/cli, with the same
 // opt-outs, the same spool and the same COLDREAD_VERIFY lines.
 //
 //	cr := coldread.New(coldread.Options{Key: "cr_pub_...", Tool: "acme", Version: "1.2.0", OptOut: "ACME_NO_TELEMETRY"})
@@ -43,7 +53,7 @@ import (
 )
 
 // Version is this SDK's version.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // DefaultEndpoint is where events go unless Options.Endpoint or
 // COLDREAD_ENDPOINT says otherwise.
@@ -394,6 +404,17 @@ func strOrNil(s string) *string {
 	return &s
 }
 
+func toWireAgent(a *Agent) *wireAgent {
+	if a == nil {
+		return nil
+	}
+	signals := a.Signals
+	if signals == nil {
+		signals = []string{}
+	}
+	return &wireAgent{Name: a.Name, Raw: strOrNil(a.Raw), Version: strOrNil(a.Version), Host: strOrNil(a.Host), Evidence: a.Evidence, Confidence: a.Confidence, Signals: signals}
+}
+
 func (c *Client) record(command string, flags []string, exit int) []byte {
 	if exit < -1024 {
 		exit = -1024
@@ -416,13 +437,7 @@ func (c *Client) record(command string, flags []string, exit int) []byte {
 		CI: c.det.ci, Interactive: c.isTTY,
 		OS: osName(), Arch: archName(), Runtime: runtimeTag(),
 	}
-	if a := c.det.agent; a != nil {
-		signals := a.Signals
-		if signals == nil {
-			signals = []string{}
-		}
-		r.Agent = &wireAgent{Name: a.Name, Raw: strOrNil(a.Raw), Version: strOrNil(a.Version), Host: strOrNil(a.Host), Evidence: a.Evidence, Confidence: a.Confidence, Signals: signals}
-	}
+	r.Agent = toWireAgent(c.det.agent)
 	if c.det.sessionID != "" {
 		r.Session = hashSession(c.det.sessionID, c.key)
 	}

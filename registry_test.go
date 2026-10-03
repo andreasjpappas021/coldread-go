@@ -14,6 +14,7 @@ func TestRegistryIsTheAgentsOne(t *testing.T) {
 	for copy, source := range map[string]string{
 		"registry.json":        "../agents/src/registry.json",
 		"testdata/parity.json": "../agents/test/parity.json",
+		"people.json":          "../python/src/coldread/people.json",
 	} {
 		want, err := os.ReadFile(source)
 		if os.IsNotExist(err) {
@@ -94,8 +95,8 @@ func deref(s *string) string {
 }
 
 // The golden cases the TypeScript (parity.test.ts) and Python
-// (test_registry.py) detectors run. The MCP-client, company and people
-// groups are for MCP servers and the server side; a CLI SDK has none.
+// (test_registry.py) detectors run. The company group (vendorOf) is
+// Coldread's server side; this SDK has no use for it.
 func TestParityCases(t *testing.T) {
 	var cases struct {
 		Detect []struct {
@@ -123,6 +124,16 @@ func TestParityCases(t *testing.T) {
 			In   []string `json:"in"`
 			Want *string  `json:"want"`
 		} `json:"agentFromProcess"`
+		MCPClientAgent []struct {
+			In   string  `json:"in"`
+			Want *string `json:"want"`
+		} `json:"mcpClientAgent"`
+		People []struct {
+			Method  string            `json:"method"`
+			Path    string            `json:"path"`
+			Headers map[string]string `json:"headers"`
+			Want    string            `json:"want"`
+		} `json:"people"`
 		FormatAgentHeader []struct {
 			In struct {
 				Name     string  `json:"name"`
@@ -136,7 +147,7 @@ func TestParityCases(t *testing.T) {
 	if err := json.Unmarshal(mustRead(t, "testdata/parity.json"), &cases); err != nil {
 		t.Fatal(err)
 	}
-	if len(cases.Detect) == 0 || len(cases.Normalize) == 0 || len(cases.ParseAgentID) == 0 || len(cases.AgentFromProcess) == 0 || len(cases.FormatAgentHeader) == 0 {
+	if len(cases.Detect) == 0 || len(cases.Normalize) == 0 || len(cases.ParseAgentID) == 0 || len(cases.AgentFromProcess) == 0 || len(cases.FormatAgentHeader) == 0 || len(cases.MCPClientAgent) == 0 || len(cases.People) == 0 {
 		t.Fatal("no cases")
 	}
 	for _, c := range cases.Detect {
@@ -164,6 +175,17 @@ func TestParityCases(t *testing.T) {
 	for _, c := range cases.AgentFromProcess {
 		if got := agentFromProcess(c.In); got != deref(c.Want) {
 			t.Errorf("agentFromProcess(%q) = %q, want %q", c.In, got, deref(c.Want))
+		}
+	}
+	for _, c := range cases.MCPClientAgent {
+		if got := mcpClientAgent(c.In); got != deref(c.Want) {
+			t.Errorf("mcpClientAgent(%q) = %q, want %q", c.In, got, deref(c.Want))
+		}
+	}
+	for _, c := range cases.People {
+		h := c.Headers
+		if got := peopleRule(c.Method, c.Path, func(n string) string { return h[n] }); got != c.Want {
+			t.Errorf("peopleRule(%s %s %v) = %s, want %s", c.Method, c.Path, c.Headers, got, c.Want)
 		}
 	}
 	for _, c := range cases.FormatAgentHeader {
@@ -207,5 +229,22 @@ func TestHeaderAncestorsAndCI(t *testing.T) {
 	no := false
 	if detectAgent(map[string]string{"CI": "1"}, false, &no).ci {
 		t.Error("the CI override was ignored")
+	}
+}
+
+// Every one of classify()'s person patterns compiles in RE2, with
+// JavaScript's \s.
+func TestPersonPatternsCompile(t *testing.T) {
+	if personUA.browser == nil || len(personUA.notPeople)+1 != personUA.total || personUA.total < 10 {
+		t.Fatalf("%d of %d person patterns compiled", len(personUA.notPeople)+1, personUA.total)
+	}
+	re, err := jsRegexp(`(?:^|[\s;(])AIAgent\/x\sy\S`, "i")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for in, want := range map[string]bool{"a\u00a0aiagent/x\u3000yz": true, "a;AIAgent/x yz": true, "aAIAgent/x yz": false, "AIAgent/x y ": false} {
+		if re.MatchString(in) != want {
+			t.Errorf("%q: %v", in, !want)
+		}
 	}
 }

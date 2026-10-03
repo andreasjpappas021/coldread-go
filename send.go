@@ -70,7 +70,7 @@ type sender struct {
 	key      string
 	ua       string
 	spool    string
-	backoff  string
+	backoff  string // "" for an MCP server, which never waits at exit
 	now      func() time.Time
 	client   *http.Client
 
@@ -245,11 +245,17 @@ func (r reply) retry() bool { return r.status == 429 || r.status >= 500 }
 
 // backedOff: a send timed out in the last backoffFor.
 func (s *sender) backedOff() bool {
+	if s.backoff == "" {
+		return false
+	}
 	st, err := os.Stat(s.backoff)
 	return err == nil && s.now().Sub(st.ModTime()) < backoffFor
 }
 
 func (s *sender) markSlow() {
+	if s.backoff == "" {
+		return
+	}
 	if os.MkdirAll(filepath.Dir(s.backoff), 0o700) == nil {
 		_ = os.WriteFile(s.backoff, nil, 0o600)
 		now := s.now()
@@ -257,7 +263,11 @@ func (s *sender) markSlow() {
 	}
 }
 
-func (s *sender) clearSlow() { _ = os.Remove(s.backoff) }
+func (s *sender) clearSlow() {
+	if s.backoff != "" {
+		_ = os.Remove(s.backoff)
+	}
+}
 
 func batchBody(records [][]byte) []byte {
 	var b bytes.Buffer

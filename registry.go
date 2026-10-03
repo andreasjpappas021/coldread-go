@@ -52,6 +52,7 @@ type processRule struct {
 
 type registryData struct {
 	Aliases      map[string]string `json:"aliases"`
+	MCPClients   map[string]string `json:"mcpClients"`
 	Rules        []agentRule       `json:"rules"`
 	GenericEnv   []string          `json:"genericEnv"`
 	ProcessNames []processRule     `json:"processNames"`
