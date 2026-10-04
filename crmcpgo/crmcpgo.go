@@ -3,7 +3,11 @@
 //
 //	cr := coldread.NewMCP(coldread.MCPOptions{Key: "cr_pub_...", Tool: "acme-mcp", Version: "1.2.0", OptOut: "ACME_NO_TELEMETRY"})
 //	defer cr.Close()
-//	s := server.NewMCPServer("acme", "1.2.0", server.WithToolHandlerMiddleware(crmcpgo.Middleware(cr)))
+//	s := server.NewMCPServer("acme", "1.2.0", server.WithToolHandlerMiddleware(crmcpgo.Middleware(cr)), server.WithHooks(crmcpgo.Hooks(cr)))
+//
+// The hooks catch the calls mcp-go refuses before any middleware runs (a
+// tool that doesn't exist): each is a failed call to the name asked for,
+// as the Node and Python SDKs record it. Your own hooks: AddHooks.
 //
 // Every tools/call is one event: the tool name, whether it failed (an
 // error, or a result with IsError), how long it took, and the client that
@@ -13,6 +17,7 @@ package crmcpgo
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"coldread.apappas.dev/go"
@@ -56,6 +61,8 @@ func Middleware(cr *coldread.MCP) server.ToolHandlerMiddleware {
 func callOf(ctx context.Context, req mcp.CallToolRequest) coldread.ToolCall {
 	call := coldread.ToolCall{Name: req.Params.Name}
 	if m := req.Params.Meta; m != nil {
+		// Codex names its session in _meta (it passes no environment).
+		call.AgentSession = coldread.CodexSession(m.AdditionalFields)
 		// A map off the wire; the SDK's own type in process.
 		switch info := m.AdditionalFields[coldread.ClientInfoMeta].(type) {
 		case map[string]any:
@@ -69,6 +76,18 @@ func callOf(ctx context.Context, req mcp.CallToolRequest) coldread.ToolCall {
 			}
 		}
 	}
+	// Over HTTP the request's header is there: the environment isn't the
+	// caller's, and the User-Agent may name it.
+	if req.Header != nil {
+		call.HTTP = true
+		call.UserAgent = req.Header.Get("User-Agent")
+	}
+	// Codex's turn metadata and no client named (stateless HTTP): Codex.
+	defer func() {
+		if call.Client.Name == "" && call.AgentSession != "" {
+			call.Client.Name = coldread.CodexClientName
+		}
+	}()
 	session := server.ClientSessionFromContext(ctx)
 	if session == nil {
 		return call
@@ -82,4 +101,33 @@ func callOf(ctx context.Context, req mcp.CallToolRequest) coldread.ToolCall {
 		call.SessionID = id
 	}
 	return call
+}
+
+// Hooks are server hooks that report the tool calls mcp-go refuses before
+// the middleware runs: a call to a tool that doesn't exist is a failed call
+// to the name asked for. Pass them with server.WithHooks; if you have hooks
+// of your own, AddHooks adds to them instead.
+func Hooks(cr *coldread.MCP) *server.Hooks {
+	h := &server.Hooks{}
+	AddHooks(cr, h)
+	return h
+}
+
+// AddHooks adds Coldread's hooks to h. Opted out, it adds nothing.
+func AddHooks(cr *coldread.MCP, h *server.Hooks) {
+	if h == nil || !cr.Enabled() {
+		return
+	}
+	h.AddOnError(func(ctx context.Context, _ any, method mcp.MCPMethod, message any, err error) {
+		if method != mcp.MethodToolsCall || !errors.Is(err, server.ErrToolNotFound) {
+			return
+		}
+		req, ok := message.(*mcp.CallToolRequest)
+		if !ok || req == nil {
+			return
+		}
+		call := callOf(ctx, *req)
+		call.Failed = true
+		cr.Record(call)
+	})
 }

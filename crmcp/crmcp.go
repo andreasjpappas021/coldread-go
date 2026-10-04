@@ -64,6 +64,8 @@ func callOf(req mcp.Request) coldread.ToolCall {
 	if r.Params != nil {
 		call.Name = r.Params.Name
 		// A map off the wire; the SDK's own type in process.
+		// Codex names its session in _meta (it passes no environment).
+		call.AgentSession = coldread.CodexSession(r.Params.Meta)
 		switch info := r.Params.Meta[coldread.ClientInfoMeta].(type) {
 		case map[string]any:
 			call.Client.Name, _ = info["name"].(string)
@@ -81,6 +83,16 @@ func callOf(req mcp.Request) coldread.ToolCall {
 			}
 		}
 		call.SessionID = r.Session.ID()
+	}
+	// Over HTTP the request's header is there: the environment isn't the
+	// caller's, and the User-Agent may name it.
+	if r.Extra != nil && r.Extra.Header != nil {
+		call.HTTP = true
+		call.UserAgent = r.Extra.Header.Get("User-Agent")
+	}
+	// Codex's turn metadata and no client named (stateless HTTP): Codex.
+	if call.Client.Name == "" && call.AgentSession != "" {
+		call.Client.Name = coldread.CodexClientName
 	}
 	return call
 }

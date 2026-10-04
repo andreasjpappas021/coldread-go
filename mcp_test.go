@@ -3,6 +3,7 @@ package coldread
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -58,7 +59,7 @@ func testMCP(t *testing.T, env map[string]string, opts MCPOptions) (*MCP, *lines
 	if opts.Version == "" {
 		opts.Version = "1.2.0"
 	}
-	m := newMCP(opts, mcpInternals{env: env, cacheDir: cache, write: out.write, testRun: bptr(false)})
+	m := newMCP(opts, mcpInternals{env: env, cacheDir: cache, tmpDir: t.TempDir(), write: out.write, testRun: bptr(false)})
 	t.Cleanup(m.Close)
 	return m, out, cache
 }
@@ -69,7 +70,7 @@ func TestMCPToolCalls(t *testing.T) {
 	if !m.Enabled() || m.Agent() == nil || m.Agent().Name != "claude-code" {
 		t.Fatal("not enabled, or no agent")
 	}
-	start := time.UnixMilli(1_760_000_000_000)
+	start := time.UnixMilli(time.Now().Add(-time.Hour).UnixMilli()) // within the spool's week
 	m.Record(ToolCall{Name: "search_docs", Start: start, Duration: 1234567 * time.Microsecond, Client: ClientInfo{Name: "claude-code", Version: "2.1.281"}, SessionID: "transport"})
 	m.Record(ToolCall{Name: "deploy", Failed: true, Duration: time.Millisecond, Client: ClientInfo{Name: "codex-mcp-client", Version: "0.1.0"}, SessionID: "transport"})
 	m.Record(ToolCall{Name: "lookup", Client: ClientInfo{Name: "\x00 Some\tClienté ", Version: "not a version!"}})
@@ -139,6 +140,62 @@ func TestMCPRemoteReadsNoEnvironment(t *testing.T) {
 	}
 }
 
+// A server on stdio and HTTP at once, started from the operator's Claude
+// Code terminal: a call over HTTP never takes the environment's agent or
+// session, whoever called; a stdio call still does.
+func TestMCPCallsOverHTTPReadNoEnvironment(t *testing.T) {
+	in := newIngest(t)
+	m, _, _ := testMCP(t, claudeEnv(), MCPOptions{Endpoint: in.endpoint()})
+	m.Record(ToolCall{Name: "http", HTTP: true, SessionID: "mcp-session-1"})
+	m.Record(ToolCall{Name: "stdio"})
+	// Stateless HTTP from Codex: no clientInfo, its User-Agent names it.
+	m.Record(ToolCall{Name: "codex", HTTP: true, UserAgent: "codex_cli_rs/0.142.5 (Mac OS 26.0.0; arm64)", AgentSession: "s1"})
+	// A client with no version takes its User-Agent's, when it's the same agent.
+	m.Record(ToolCall{Name: "codex2", HTTP: true, Client: ClientInfo{Name: CodexClientName}, UserAgent: "codex_cli_rs/0.142.5"})
+	// A User-Agent the registry doesn't know names nothing.
+	m.Record(ToolCall{Name: "script", HTTP: true, UserAgent: "python-httpx/0.27.0"})
+	m.Flush(context.Background())
+	recs := in.mcpRecords(t)
+	by := map[string]mcpWire{}
+	for _, r := range recs {
+		by[r.Command] = r
+	}
+	if r := by["http"]; r.Agent != nil || r.Session != hashSession("mcp-session-1", testKey) {
+		t.Errorf("http: %+v", r)
+	}
+	if r := by["stdio"]; r.Agent == nil || r.Agent.Name != "claude-code" {
+		t.Errorf("stdio: %+v", r)
+	}
+	if r := by["codex"]; r.Agent != nil || r.Client == nil || r.Client.Name != "codex_cli_rs" || r.Client.Version == nil || *r.Client.Version != "0.142.5" || r.Session != hashSession("s1", testKey) {
+		t.Errorf("codex: %+v", r)
+	}
+	if r := by["codex2"]; r.Client == nil || r.Client.Name != CodexClientName || r.Client.Version == nil || *r.Client.Version != "0.142.5" {
+		t.Errorf("codex2: %+v", r)
+	}
+	if r := by["script"]; r.Client != nil || r.Agent != nil {
+		t.Errorf("script: %+v", r)
+	}
+}
+
+// What a killed run left on disk goes shortly after the next start, though
+// that start makes no call.
+func TestMCPSendsTheSpoolShortlyAfterStart(t *testing.T) {
+	in := newIngest(t)
+	cache := t.TempDir()
+	left := withKey(rec("left", time.Now(), ""), testKey)
+	if err := toSpool(filepath.Join(cache, "spool.jsonl"), [][]byte{left}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	_ = newMCP(MCPOptions{Key: testKey, Tool: "acme-mcp", Endpoint: in.endpoint()}, mcpInternals{env: map[string]string{}, cacheDir: cache, tmpDir: t.TempDir(), write: (&lines{}).write, testRun: bptr(false), startDrain: 10 * time.Millisecond})
+	deadline := time.Now().Add(2 * time.Second)
+	for len(in.commands()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := in.commands(); len(got) != 1 || got[0] != "left" {
+		t.Fatalf("sent %v", got)
+	}
+}
+
 func TestMCPSpoolsWhatDoesntGetThrough(t *testing.T) {
 	in := newIngest(t)
 	in.set(503, `{}`)
@@ -151,7 +208,8 @@ func TestMCPSpoolsWhatDoesntGetThrough(t *testing.T) {
 	in.set(202, `{"accepted":2,"rejected":[]}`)
 	m.Record(ToolCall{Name: "second"})
 	m.Flush(context.Background())
-	if got := in.commands(); !reflect.DeepEqual(got, []string{"first", "second", "first"}) {
+	// The spool, oldest first: each event is in it as soon as it happens.
+	if got := in.commands(); !reflect.DeepEqual(got, []string{"first", "first", "second"}) {
 		t.Errorf("sent %v", got)
 	}
 	if got := spooled(t, cache); len(got) != 0 {
@@ -191,6 +249,10 @@ func TestMCPDebugAndVerify(t *testing.T) {
 	if !reflect.DeepEqual(out.all(), []string{VerifyAccepted}) || len(in.posts()) != 1 {
 		t.Errorf("verify: %q", out.all())
 	}
+	// An install check says so, so it's kept out of every number.
+	if raw := string(in.posts()[0].body.Records[0]); !strings.Contains(raw, `"verify":true`) {
+		t.Errorf("verify record: %s", raw)
+	}
 	in.set(401, `{"error":"Unknown or revoked key."}`)
 	m.Record(ToolCall{Name: "t"})
 	m.Flush(context.Background())
@@ -220,7 +282,7 @@ func TestMCPOff(t *testing.T) {
 		}
 	}
 	// A test binary never sends to Coldread's own endpoint.
-	m := newMCP(MCPOptions{Key: testKey, Tool: "x"}, mcpInternals{env: map[string]string{}, cacheDir: t.TempDir(), write: (&lines{}).write, testRun: bptr(true)})
+	m := newMCP(MCPOptions{Key: testKey, Tool: "x"}, mcpInternals{env: map[string]string{}, cacheDir: t.TempDir(), tmpDir: t.TempDir(), write: (&lines{}).write, testRun: bptr(true)})
 	if m.Enabled() {
 		t.Error("enabled in a test binary")
 	}
@@ -247,5 +309,37 @@ func TestReadClient(t *testing.T) {
 		if got := readClient(in); !reflect.DeepEqual(got, want) {
 			t.Errorf("readClient(%+v) = %+v, want %+v", in, got, want)
 		}
+	}
+}
+
+// Each call is in the spool the moment it's recorded: a server killed right
+// after loses nothing (the next send takes it).
+func TestMCPEachCallIsSpooledAtOnce(t *testing.T) {
+	in := newIngest(t)
+	m, _, cache := testMCP(t, nil, MCPOptions{Endpoint: in.endpoint(), FlushInterval: time.Hour})
+	m.Record(ToolCall{Name: "search_docs"})
+	if got := spooled(t, cache); !reflect.DeepEqual(got, []string{"search_docs"}) {
+		t.Fatalf("spool %v", got)
+	}
+	m.Flush(context.Background())
+	if got := in.commands(); !reflect.DeepEqual(got, []string{"search_docs"}) || len(spooled(t, cache)) != 0 {
+		t.Fatalf("sent %v, spool %v", got, spooled(t, cache))
+	}
+}
+
+// Codex passes MCP servers no environment, but names its session on every
+// call: that's the session, ahead of the transport's.
+func TestMCPCodexSession(t *testing.T) {
+	sid := "01a104fe-3eb7-7603-aa88-9667e3f20578"
+	meta := map[string]any{CodexTurnMeta: map[string]any{"session_id": sid, "thread_id": sid, "turn_id": "t"}}
+	if CodexSession(meta) != sid || CodexSession(map[string]any{CodexTurnMeta: map[string]any{"thread_id": "t1"}}) != "t1" || CodexSession(nil) != "" || CodexSession(map[string]any{CodexTurnMeta: "x"}) != "" {
+		t.Fatal("CodexSession")
+	}
+	in := newIngest(t)
+	m, _, _ := testMCP(t, nil, MCPOptions{Endpoint: in.endpoint()})
+	m.Record(ToolCall{Name: "t", Client: ClientInfo{Name: "codex-mcp-client"}, AgentSession: CodexSession(meta), SessionID: "transport"})
+	m.Flush(context.Background())
+	if r := in.mcpRecords(t)[0]; r.Session != hashSession(sid, testKey) {
+		t.Fatalf("%+v", r)
 	}
 }

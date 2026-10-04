@@ -145,7 +145,7 @@ func normalizeAgentName(raw string) string {
 }
 
 var (
-	underscoredID = regexp.MustCompile(`^([A-Za-z][\w.-]*?)_(\d+(?:-\d+)+)_agent$`)
+	underscoredID = regexp.MustCompile(`^([A-Za-z][\w.-]*?)_(\d+(?:-\d+)+)_[a-z][a-z0-9-]{0,31}$`)
 	slashedID     = regexp.MustCompile(`^([^/\t\n\v\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]+)/v?(\d[\w.+-]{0,31})$`)
 	versionRe     = regexp.MustCompile(`^v?(\d[\w.+-]{0,31})$`)
 )

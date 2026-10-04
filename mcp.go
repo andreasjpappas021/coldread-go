@@ -32,11 +32,23 @@ import (
 // knows it. For stdio servers, which run inside the agent's environment,
 // the markers the CLI reads back it up; set Remote for an HTTP server.
 //
-// Events are batched (2s or 20 events) and sent from a goroutine, so a tool
-// call never waits on Coldread; what doesn't get through waits in the same
-// spool @coldread/cli uses and goes with the next batch. Nothing is written
-// to stdout, which stdio servers use for the protocol. Opted out
+// Each event is written to the spool (@coldread/cli's) as the call ends, so
+// a server killed at any moment loses nothing: clients shut stdio servers
+// down hard (Claude Code: SIGINT, SIGTERM 100 ms later, SIGKILL ~500 ms in;
+// Codex: stdin EOF and SIGTERM together, SIGKILL ~250 ms in), and a host
+// that log.Fatal's on ServeStdio's "context canceled" never runs Close. A
+// goroutine sends the spool every 2s or 20 events; Close sends the rest,
+// and whatever a kill leaves on disk goes with the next start. No signal
+// is caught unless the server asks (FlushOnSignal). A tool call never
+// waits on Coldread. Nothing is written to
+// stdout, which stdio servers use for the protocol. Opted out
 // (DO_NOT_TRACK, COLDREAD_DISABLED, OptOut), nothing is recorded.
+//
+// Sessions: the agent's own (its environment, when it agrees with the
+// client), else one the agent names on the call (ToolCall.AgentSession:
+// Codex's _meta turn metadata, CodexSession), else the transport's
+// (Streamable HTTP). Hashed either way. The stateless protocol (2026-07-28)
+// carries none: those calls have no session.
 // COLDREAD_VERIFY=1 sends each call at once and prints what came back on
 // stderr: "[coldread] verify: accepted", or why not. COLDREAD_DEBUG=1
 // prints each event there and sends nothing.
@@ -44,6 +56,25 @@ import (
 // ClientInfoMeta is the _meta key a client names itself under on each
 // request (the stateless MCP spec).
 const ClientInfoMeta = "io.modelcontextprotocol/clientInfo"
+
+// CodexTurnMeta is the _meta key Codex sends its turn under: session_id,
+// thread_id, turn_id and more. Codex passes MCP servers no environment, so
+// this is its session.
+const CodexTurnMeta = "x-codex-turn-metadata"
+
+// CodexSession is Codex's session id from a request's _meta, or "".
+func CodexSession(meta map[string]any) string {
+	turn, _ := meta[CodexTurnMeta].(map[string]any)
+	if turn == nil {
+		return ""
+	}
+	for _, k := range []string{"session_id", "thread_id"} {
+		if id, _ := turn[k].(string); jsTrim(id) != "" && len(id) <= 256 {
+			return jsTrim(id)
+		}
+	}
+	return ""
+}
 
 const mcpBatch = 20
 
@@ -73,6 +104,12 @@ type MCPOptions struct {
 	// FlushInterval is the longest an event waits before its batch is
 	// sent. Default 2s.
 	FlushInterval time.Duration
+	// FlushOnSignal, for a stdio server with no signal handling of its
+	// own: its client's SIGINT or SIGTERM sends the spool first (100 ms at
+	// most), then the signal is raised again. Off by default: catching a
+	// signal turns its default exit off, and the events are on disk
+	// already.
+	FlushOnSignal bool
 }
 
 // ClientInfo is the MCP client that called, as it named itself.
@@ -91,6 +128,39 @@ type ToolCall struct {
 	// SessionID is the transport's session (Streamable HTTP), if any. It
 	// is hashed before it leaves the process.
 	SessionID string
+	// AgentSession is a session the agent named on the call itself
+	// (Codex's _meta turn metadata: CodexSession). Hashed too; it wins over
+	// SessionID.
+	AgentSession string
+	// HTTP: the call came over HTTP (Streamable HTTP, SSE), not stdio. The
+	// agent's markers in this process's environment are then the
+	// operator's, not the caller's, so they aren't read for it (Remote
+	// does the same for every call). crmcp and crmcpgo set it.
+	HTTP bool
+	// UserAgent is the HTTP request's User-Agent, if any. A client the
+	// registry knows by it (Codex's codex_cli_rs/0.142.5) names a call that
+	// names no client, and gives its version to one that has none.
+	UserAgent string
+}
+
+// CodexClientName is the client name Codex's MCP client gives itself. A
+// call with Codex's turn metadata and no client named is Codex's
+// (stateless HTTP carries no initialize).
+const CodexClientName = "codex-mcp-client"
+
+var uaProductRe = regexp.MustCompile(`^([A-Za-z0-9._-]{1,64})/([^\s;()]{1,32})`)
+
+// uaClient: the client a User-Agent names, when the registry knows it as
+// an agent ("codex_cli_rs/0.142.5"); nil for anything else.
+func uaClient(ua string) *wireClient {
+	m := uaProductRe.FindStringSubmatch(jsTrim(ua))
+	if m == nil {
+		return nil
+	}
+	if agent := mcpClientAgent(m[1]); agent == "" || registry.Vendors[agent] == "" {
+		return nil
+	}
+	return &wireClient{Name: m[1], Version: strOrNil(cleanVersion(m[2]))}
 }
 
 // MCP reports an MCP server's tool calls. The zero value and nil do nothing.
@@ -107,7 +177,7 @@ type MCP struct {
 	s             *sender
 
 	mu     sync.Mutex
-	queue  [][]byte
+	queued int // events in the spool since the last send
 	timer  *time.Timer
 	sendMu sync.Mutex // one send at a time: they share the spool
 	// Sends in progress, and a channel closed when they next reach none.
@@ -119,10 +189,18 @@ type MCP struct {
 type mcpInternals struct {
 	env      map[string]string
 	cacheDir string
+	tmpDir   string
 	now      func() time.Time
 	write    func(string)
 	testRun  *bool
+	// startDrain: how long after start the spool is sent (0: startDrainDelay).
+	startDrain time.Duration
 }
+
+// startDrainDelay: what a killed run left on disk goes this long after the
+// next start, whether or not that start makes a call (Claude Code starts
+// every server each session). In the background, never blocking the server.
+const startDrainDelay = time.Second
 
 // NewMCP starts reporting an MCP server's tool calls. One per process,
 // shared by every server it creates (a server per session is fine).
@@ -187,7 +265,36 @@ func newMCP(opts MCPOptions, in mcpInternals) (m *MCP) {
 	}
 	m.s = newSender(endpoint, m.key, "coldread-go/"+Version, filepath.Join(cacheDir, "spool.jsonl"), now)
 	m.s.backoff = ""
+	tmp := in.tmpDir
+	if tmp == "" {
+		tmp = os.TempDir()
+	}
+	m.s.alt = tmpSpoolFor(m.tool, tmp)
+	if opts.FlushOnSignal && !opts.Remote && !m.debug && !m.verify {
+		m.watchSignals()
+	}
+	if !m.debug && !m.verify && !m.offline {
+		d := in.startDrain
+		if d <= 0 {
+			d = startDrainDelay
+		}
+		go m.drainAtStart(d)
+	}
 	return m
+}
+
+// drainAtStart sends what an earlier run left in the spool (each event with
+// its own key and id), when there is any. Close doesn't wait for it: a
+// server that stops sooner leaves the spool for the start after.
+func (m *MCP) drainAtStart(d time.Duration) {
+	defer func() { _ = recover() }()
+	time.Sleep(d)
+	if _, err := os.Stat(m.s.spool); err != nil {
+		if _, err := os.Stat(m.s.alt); m.s.alt == "" || err != nil {
+			return
+		}
+	}
+	m.send(nil)
 }
 
 // Enabled is false when opted out (DO_NOT_TRACK, COLDREAD_DISABLED,
@@ -224,7 +331,11 @@ type mcpRecord struct {
 	OS         string      `json:"os"`
 	Arch       string      `json:"arch"`
 	Runtime    string      `json:"runtime"`
+	ID         string      `json:"id,omitempty"`
 	Session    string      `json:"session,omitempty"`
+	// Verify: sent under COLDREAD_VERIFY=1, an install check, kept out of
+	// every number on the dashboard.
+	Verify bool `json:"verify,omitempty"`
 }
 
 var notPrintableRe = regexp.MustCompile(`[^\x20-\x7e]`)
@@ -276,7 +387,7 @@ func (m *MCP) Record(c ToolCall) {
 		return
 	}
 	defer func() { _ = recover() }() // never break the host
-	command := cleanCommand(c.Name)
+	command := cleanToolName(c.Name)
 	if command == "" {
 		return
 	}
@@ -292,6 +403,15 @@ func (m *MCP) Record(c ToolCall) {
 		d = 86_400_000
 	}
 	client := readClient(c.Client)
+	if ua := uaClient(c.UserAgent); ua != nil {
+		if client == nil {
+			client = ua
+		} else if client.Version == nil && mcpClientAgent(client.Name) == mcpClientAgent(ua.Name) {
+			client.Version = ua.Version
+		}
+	}
+	// A call over HTTP is never the environment's: its markers are the
+	// operator's terminal, not whoever called.
 	// The environment only speaks for the client when they agree: Codex
 	// started from a Claude Code terminal inherits Claude Code's variables,
 	// and its calls mustn't carry Claude Code's host or session.
@@ -300,7 +420,7 @@ func (m *MCP) Record(c ToolCall) {
 		clientAgent = mcpClientAgent(client.Name)
 	}
 	var envAgent *Agent
-	if m.det != nil && m.det.agent != nil && (clientAgent == "" || clientAgent == m.det.agent.Name) {
+	if m.det != nil && !c.HTTP && m.det.agent != nil && (clientAgent == "" || clientAgent == m.det.agent.Name) {
 		envAgent = m.det.agent
 	}
 	exit := 0
@@ -312,13 +432,17 @@ func (m *MCP) Record(c ToolCall) {
 		Tool:    wireTool{Name: m.tool, Version: strOrNil(m.version)},
 		Command: command, Exit: exit, DurationMs: d,
 		Agent: toWireAgent(envAgent), Client: client,
-		OS: osName(), Arch: archName(), Runtime: runtimeTag(),
+		OS: osName(), Arch: archName(), Runtime: runtimeTag(), ID: newEventID(),
+		Verify: m.verify,
 	}
 	// The agent's own session when the environment has it, else the
 	// transport's: hashed either way.
 	sid := ""
 	if envAgent != nil {
 		sid = m.det.sessionID
+	}
+	if sid == "" {
+		sid = c.AgentSession
 	}
 	if sid == "" {
 		sid = c.SessionID
@@ -352,9 +476,16 @@ func (m *MCP) Record(c ToolCall) {
 	if m.debug {
 		return
 	}
+	// To the spool now: a kill at any moment loses nothing.
+	if _, err := m.s.save([][]byte{record}); err != nil {
+		return
+	}
+	if m.offline {
+		return // waits there for a run with network
+	}
 	m.mu.Lock()
-	m.queue = append(m.queue, record)
-	full := len(m.queue) >= mcpBatch
+	m.queued++
+	full := m.queued >= mcpBatch
 	if !full && m.timer == nil {
 		m.timer = time.AfterFunc(m.flushInterval, m.flushQueue)
 	}
@@ -364,26 +495,26 @@ func (m *MCP) Record(c ToolCall) {
 	}
 }
 
-// flushQueue hands what's queued to a send, in the background.
+// flushQueue sends the spool, in the background.
 func (m *MCP) flushQueue() {
 	m.mu.Lock()
 	if m.timer != nil {
 		m.timer.Stop()
 		m.timer = nil
 	}
-	records := m.queue
-	m.queue = nil
-	if len(records) > 0 {
+	queued := m.queued
+	m.queued = 0
+	if queued > 0 {
 		m.pending++
 	}
 	m.mu.Unlock()
-	if len(records) == 0 {
+	if queued == 0 {
 		return
 	}
 	go func() {
 		defer m.end()
 		defer func() { _ = recover() }()
-		m.send(records)
+		m.send(nil)
 	}()
 }
 
@@ -412,11 +543,11 @@ func (m *MCP) send(records [][]byte) {
 	defer m.sendMu.Unlock()
 	now := m.now()
 	if m.offline {
-		toSpool(m.s.spool, records, now)
+		_, _ = m.s.save(records)
 		return
 	}
-	claimed := claimSpool(m.s.spool, now)
-	spooled := readClaimed(claimed, now)
+	claimed := m.s.claim(now)
+	spooled := m.s.spooled(claimed, now)
 	removeAll(claimed)
 	rest := append(records, spooled...)
 	for i := 0; i < 8 && len(rest) > 0; i++ {
@@ -430,7 +561,7 @@ func (m *MCP) send(records [][]byte) {
 			break
 		}
 	}
-	toSpool(m.s.spool, rest, m.now())
+	_, _ = m.s.save(rest)
 }
 
 // Flush sends what's queued now and waits for every send in progress, or

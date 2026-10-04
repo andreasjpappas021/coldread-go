@@ -2,9 +2,11 @@ package coldread
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -90,14 +92,50 @@ func TestAServerThatHangsCostsExitWaitAtMost(t *testing.T) {
 	}
 }
 
+// blackHole: an https endpoint whose TLS handshake never completes (it
+// accepts and says nothing), like a network that swallows packets: no
+// connection to Coldread ever opens.
+func blackHole(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		ln.Close()
+		mu.Lock()
+		for _, c := range conns {
+			c.Close()
+		}
+		mu.Unlock()
+	})
+	return "https://" + ln.Addr().String() + "/api/ingest"
+}
+
 // A network that swallows packets costs one command the wait, not every
-// command: after a timeout, runs spool without waiting until an answer comes.
+// command: after a timeout that never connected, runs spool without
+// waiting, while their startup send keeps probing; the first connection
+// clears the mark and that run sends at exit as usual. A slow answer over a
+// connection that did open is latency, and leaves no mark.
 func TestAfterATimeoutRunsDontWait(t *testing.T) {
 	in := newIngest(t)
-	in.delay = time.Second
+	hole := blackHole(t)
 	cache := t.TempDir()
-	finish := func(command string, beforeFinish func(*run)) time.Duration {
-		r := start(t, setup{cache: cache, opts: Options{Endpoint: in.endpoint()}})
+	finish := func(endpoint, command string, beforeFinish func(*run)) time.Duration {
+		r := start(t, setup{cache: cache, opts: Options{Endpoint: endpoint}})
 		if beforeFinish != nil {
 			beforeFinish(r)
 		}
@@ -106,40 +144,70 @@ func TestAfterATimeoutRunsDontWait(t *testing.T) {
 		r.c.Finish(0)
 		return time.Since(t0)
 	}
-	if took := finish("one", nil); took < ExitWait-50*time.Millisecond {
+	mark := filepath.Join(cache, "backoff")
+
+	// Latency (it connects, then answers late): one wait, no mark.
+	in.mu.Lock()
+	in.delay = time.Second
+	in.mu.Unlock()
+	if took := finish(in.endpoint(), "slow", nil); took < ExitWait-50*time.Millisecond {
 		t.Fatalf("first run took %v", took)
 	}
-	if _, err := os.Stat(filepath.Join(cache, "backoff")); err != nil {
-		t.Fatal("no backoff mark after a timeout")
+	if _, err := os.Stat(mark); err == nil {
+		t.Fatal("a slow answer marked the network as dropping packets")
+	}
+	in.mu.Lock()
+	in.delay = 0
+	in.mu.Unlock()
+
+	if took := finish(hole, "one", nil); took < ExitWait-50*time.Millisecond {
+		t.Fatalf("black-holed run took %v", took)
+	}
+	if _, err := os.Stat(mark); err != nil {
+		t.Fatal("no backoff mark after a timeout that never connected")
 	}
 	// The next run's startup send is still hanging when it finishes: its
-	// events go back, and it doesn't wait.
-	if took := finish("two", nil); took > 50*time.Millisecond {
+	// events go back, and it doesn't wait (but for its probe's moment).
+	if took := finish(hole, "two", nil); took > probeWait+70*time.Millisecond {
 		t.Fatalf("a run after a timeout took %v", took)
 	}
 	got := spooled(t, cache)
-	if len(got) != 2 {
+	if len(got) != 3 {
 		t.Fatalf("spool %v", got)
 	}
 	if left, _ := filepath.Glob(filepath.Join(cache, "*.sending")); len(left) != 0 {
 		t.Fatalf("claims left: %v", left)
 	}
-	// Coldread answers again: a run whose startup send gets through clears
-	// the mark, and the one after sends at exit as usual.
-	in.mu.Lock()
-	in.delay = 0
-	in.mu.Unlock()
-	finish("three", func(r *run) { <-r.c.drained })
-	if _, err := os.Stat(filepath.Join(cache, "backoff")); err == nil {
-		t.Fatal("mark kept after an answer")
-	}
+	// The network works again: the run's own startup connection (the probe)
+	// clears the mark, and that same run sends at exit as usual, however
+	// fast it is.
 	before := len(in.posts())
-	finish("four", nil)
-	if len(in.posts()) != before+1 {
+	finish(in.endpoint(), "three", func(r *run) {
+		deadline := time.Now().Add(2 * time.Second)
+		for !r.c.s.reached.Load() && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+	})
+	if _, err := os.Stat(mark); err == nil {
+		t.Fatal("mark kept after a connection opened")
+	}
+	if len(in.posts()) < before+1 {
 		t.Fatal("not sent at exit once the mark was cleared")
 	}
+	// A fast run that starts backed off, on a network that works again: its
+	// probe connects within the exit's moment, the mark goes, and it sends.
+	_ = os.WriteFile(mark, nil, 0o600)
+	before = len(in.posts())
+	finish(in.endpoint(), "fast", nil)
+	if _, err := os.Stat(mark); err == nil {
+		t.Fatal("a fast run left the mark on a working network")
+	}
+	if len(in.posts()) < before+1 {
+		t.Fatal("the fast run wasn't sent at exit")
+	}
+	finish(in.endpoint(), "four", nil)
 	cmds := strings.Join(in.commands(), ",")
-	for _, c := range []string{"one", "two", "three", "four"} {
+	for _, c := range []string{"slow", "one", "two", "three", "four"} {
 		if !strings.Contains(cmds, c) {
 			t.Errorf("%s never sent: %s", c, cmds)
 		}
@@ -258,7 +326,8 @@ func TestAClaimLeftByAKilledRunIsPickedUp(t *testing.T) {
 	spool := filepath.Join(cache, "spool.jsonl")
 	orphan := spool + ".999.1.sending"
 	toSpool(orphan, [][]byte{rec("orphan", time.Now(), "")}, time.Now())
-	fresh := spool + ".998.1.sending"
+	// A fresh claim by a live process (this test's parent) is left alone.
+	fresh := spool + "." + itoa(os.Getppid()) + ".1.sending"
 	toSpool(fresh, [][]byte{rec("in-flight", time.Now(), "")}, time.Now())
 	old := time.Now().Add(-2 * staleClaim)
 	_ = os.Chtimes(orphan, old, old)
@@ -269,6 +338,29 @@ func TestAClaimLeftByAKilledRunIsPickedUp(t *testing.T) {
 	}
 	if _, err := os.Stat(fresh); err != nil {
 		t.Fatal("took another run's claim")
+	}
+}
+
+// A server killed mid-send (Codex: stdin EOF, then SIGTERM a moment later)
+// leaves a fresh claim; its process is gone, so the next start takes it at
+// once rather than 60 s later.
+func TestAFreshClaimOfADeadProcessIsTakenAtOnce(t *testing.T) {
+	in := newIngest(t)
+	cache := t.TempDir()
+	spool := filepath.Join(cache, "spool.jsonl")
+	dead := exec.Command("true")
+	if err := dead.Run(); err != nil {
+		t.Skip("no true(1)")
+	}
+	stranded := spool + "." + itoa(dead.Process.Pid) + ".1.sending"
+	toSpool(stranded, [][]byte{rec("stranded", time.Now(), "")}, time.Now())
+	r := start(t, setup{cache: cache, opts: Options{Endpoint: in.endpoint()}})
+	<-r.c.drained
+	if got := in.commands(); len(got) != 1 || got[0] != "stranded" {
+		t.Fatalf("sent %v", got)
+	}
+	if _, err := os.Stat(stranded); err == nil {
+		t.Fatal("claim left behind")
 	}
 }
 
@@ -310,5 +402,131 @@ func TestWhyNamesErrors(t *testing.T) {
 	s = newSender("http://coldread-does-not-exist.invalid/api/ingest", testKey, "t", filepath.Join(t.TempDir(), "s"), time.Now)
 	if _, err = s.post(context.Background(), [][]byte{rec("x", time.Now(), "")}); err == nil || why(err) != "ENOTFOUND" {
 		t.Fatalf("%v → %q", err, why(err))
+	}
+}
+
+// codexEnv: Codex's default sandbox, which has no network.
+func codexEnv() map[string]string {
+	return map[string]string{"CODEX_THREAD_ID": "019a-thread", "CODEX_SANDBOX_NETWORK_DISABLED": "1", "HOME": "/home/x"}
+}
+
+// readOnly makes dir unwritable for the test (Codex's Seatbelt blocks
+// writes outside the workspace and the temp folder).
+func readOnly(t *testing.T, dir string) {
+	t.Helper()
+	if os.Getuid() == 0 {
+		t.Skip("root writes anywhere")
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+}
+
+func spooledAt(t *testing.T, file string) []string {
+	t.Helper()
+	var out []string
+	for _, r := range readSpool(file, time.Now()) {
+		var x struct{ Command string }
+		_ = json.Unmarshal(r, &x)
+		out = append(out, x.Command)
+	}
+	return out
+}
+
+// The cache can't be written (Codex's sandbox): the event waits in the
+// temp folder, and the next run with network sends it from there.
+func TestSandboxSpoolsToTempAndTheNextRunSendsIt(t *testing.T) {
+	in := newIngest(t)
+	cache, tmp := t.TempDir(), t.TempDir()
+	readOnly(t, cache)
+	r := start(t, setup{env: codexEnv(), cache: cache, tmp: tmp, opts: Options{Endpoint: in.endpoint()}})
+	r.c.Track("build")
+	r.c.Finish(0)
+	alt := tmpSpoolFor("acme", tmp)
+	if got := spooledAt(t, alt); len(got) != 1 || got[0] != "build" {
+		t.Fatalf("temp spool %v", got)
+	}
+	if st, err := os.Stat(tmpTop(alt)); err != nil || st.Mode().Perm() != 0o700 {
+		t.Fatalf("temp folder %v %v", st, err)
+	}
+	if len(in.posts()) != 0 {
+		t.Fatal("sent without network")
+	}
+	// Later, with network and a writable cache: both spools go.
+	_ = os.Chmod(cache, 0o700)
+	if err := toSpool(filepath.Join(cache, "spool.jsonl"), [][]byte{rec("cached", time.Now(), "")}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	r2 := start(t, setup{cache: cache, tmp: tmp, opts: Options{Endpoint: in.endpoint()}})
+	<-r2.c.drained
+	r2.c.Track("serve")
+	r2.c.Finish(0)
+	got := in.commands()
+	if len(got) != 3 || !contains(got, "build") || !contains(got, "cached") || !contains(got, "serve") {
+		t.Fatalf("sent %v", got)
+	}
+	if spooledAt(t, alt) != nil || spooled(t, cache) != nil {
+		t.Fatal("spool left")
+	}
+}
+
+// COLDREAD_VERIFY says where the event waits, or why it couldn't.
+func TestSandboxVerifySaysWhere(t *testing.T) {
+	in := newIngest(t)
+	cache, tmp := t.TempDir(), t.TempDir()
+	readOnly(t, cache)
+	r := start(t, setup{env: with(codexEnv(), "COLDREAD_VERIFY", "1"), cache: cache, tmp: tmp, opts: Options{Endpoint: in.endpoint()}})
+	r.c.Track("build")
+	r.c.Finish(0)
+	want := "[coldread] verify: no network here; saved for the next run with network (" + tmpSpoolFor("acme", tmp) + ").\n"
+	if got := r.lines(); len(got) != 1 || got[0] != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	// Neither folder writable: it says so.
+	tmp2 := t.TempDir()
+	readOnly(t, tmp2)
+	r2 := start(t, setup{env: with(codexEnv(), "COLDREAD_VERIFY", "1"), cache: cache, tmp: tmp2, opts: Options{Endpoint: in.endpoint()}})
+	r2.c.Track("build")
+	r2.c.Finish(0)
+	if got := r2.lines(); len(got) != 1 || got[0] != "[coldread] verify: no network here; not saved (EACCES), so this event is lost.\n" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// Someone else's folder in a shared /tmp is never written or read.
+func TestTempSpoolOnlyInAPrivateFolder(t *testing.T) {
+	if os.Getuid() < 0 {
+		t.Skip("no uids")
+	}
+	cache, tmp := t.TempDir(), t.TempDir()
+	readOnly(t, cache)
+	alt := tmpSpoolFor("acme", tmp)
+	if err := os.MkdirAll(filepath.Dir(alt), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(tmpTop(alt), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(alt, append(rec("planted", time.Now(), ""), '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := start(t, setup{env: with(codexEnv(), "COLDREAD_VERIFY", "1"), cache: cache, tmp: tmp})
+	r.c.Track("build")
+	r.c.Finish(0)
+	if got := spooledAt(t, alt); len(got) != 1 || got[0] != "planted" {
+		t.Fatalf("wrote to a shared folder: %v", got)
+	}
+	if got := r.lines(); len(got) != 1 || !strings.Contains(got[0], "not saved") {
+		t.Fatalf("%q", got)
+	}
+	in := newIngest(t)
+	_ = os.Chmod(cache, 0o700)
+	r2 := start(t, setup{cache: cache, tmp: tmp, opts: Options{Endpoint: in.endpoint()}})
+	<-r2.c.drained
+	r2.c.Track("serve")
+	r2.c.Finish(0)
+	if got := in.commands(); len(got) != 1 || got[0] != "serve" {
+		t.Fatalf("read a shared folder: %v", got)
 	}
 }

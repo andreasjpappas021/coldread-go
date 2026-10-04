@@ -71,6 +71,7 @@ func tree() (root, preview *cobra.Command) {
 }
 
 func TestTrack(t *testing.T) {
+	t.Setenv("COLDREAD_VERIFY", "1") // a test binary sends only when verifying (to an endpoint that isn't production)
 	for _, c := range []struct {
 		args    []string
 		command string
@@ -92,6 +93,59 @@ func TestTrack(t *testing.T) {
 		recs := s.records()
 		if len(recs) != 1 || recs[0].Command != c.command || strings.Join(recs[0].Flags, " ") != c.flags {
 			t.Errorf("%v: got %+v", c.args, recs)
+		}
+	}
+}
+
+// What Report sends for each way cobra ends: refused command lines as the
+// command tried with cobra's exit 1 (an unknown command as its own word; a
+// parent with no Run given an unknown word, which cobra answers with help
+// and 0, as exit 2), help, version, completion and a bare parent not at all,
+// failures as the command with exit 1.
+func TestReport(t *testing.T) {
+	t.Setenv("COLDREAD_VERIFY", "1")
+	for _, c := range []struct {
+		args    []string
+		command string // "" = nothing sent
+		flags   string
+		exit    int
+		code    int
+	}{
+		{[]string{"deploy", "preview", "--prod"}, "deploy preview", "--prod", 0, 0},
+		{[]string{"publsh"}, "publsh", "", 1, 1},
+		{[]string{"postgres://admin:hunter2@db/app"}, "acme", "", 1, 1},
+		{[]string{"deploy", "preview", "--nosuch"}, "deploy preview", "", 1, 1},
+		{[]string{"deploy", "preview", "--token"}, "deploy preview", "", 1, 1},
+		{[]string{"--nosuchflag"}, "acme", "", 1, 1},
+		{[]string{"args", "a", "b"}, "args", "", 1, 1},
+		{[]string{"fail"}, "fail", "", 1, 1},
+		{[]string{"--help"}, "", "", 0, 0},
+		{[]string{"deploy", "preview", "--help"}, "", "", 0, 0},
+		{[]string{"help", "deploy"}, "", "", 0, 0},
+		{[]string{"deploy"}, "", "", 0, 0},
+		{[]string{"deploy", "nosuch"}, "deploy nosuch", "", 2, 0},
+		{[]string{"completion", "zsh"}, "", "", 0, 0},
+		{[]string{"__complete", "dep"}, "", "", 0, 0},
+	} {
+		s := newServer(t)
+		cr := coldread.New(coldread.Options{Key: key, Tool: "acme", Version: "1.2.0", Endpoint: s.URL, NoNotice: true})
+		root, _ := tree()
+		root.AddCommand(&cobra.Command{Use: "args", Args: cobra.ExactArgs(1), Run: func(*cobra.Command, []string) {}})
+		root.SetArgs(c.args)
+		root.SetOut(io.Discard)
+		root.SetErr(io.Discard)
+		cmd, err := root.ExecuteC()
+		code := crcobra.Report(cr, cmd, err)
+		cr.Finish(code)
+		recs := s.records()
+		if c.command == "" {
+			if len(recs) != 0 {
+				t.Errorf("%v: sent %+v", c.args, recs)
+			}
+			continue
+		}
+		if code != c.code || len(recs) != 1 || recs[0].Command != c.command || strings.Join(recs[0].Flags, " ") != c.flags || recs[0].Exit != c.exit {
+			t.Errorf("%v: code %d, got %+v (err %v)", c.args, code, recs, err)
 		}
 	}
 }
@@ -159,5 +213,18 @@ func TestExecuteInARealBinary(t *testing.T) {
 	}
 	if code, stderr := runIt(clean("COLDREAD_VERIFY=1", "ACME_NO_TELEMETRY=1"), "status"); code != 0 || strings.TrimSpace(stderr) != "[coldread] verify: not sending (ACME_NO_TELEMETRY)." {
 		t.Errorf("opted out: %d %q", code, stderr)
+	}
+	// A panic: recorded as exit 2 under its command, and still a panic.
+	code, stderr = runIt(clean("COLDREAD_VERIFY=1"), "boom")
+	if code != 2 || !strings.Contains(stderr, "panic: assignment to entry in nil map") || !strings.Contains(stderr, coldread.VerifyAccepted) {
+		t.Errorf("panic: exit %d, stderr %q", code, stderr)
+	}
+	// An unknown command: its own word, with the 1 the process exits with, as cobra's does.
+	if code, _ := runIt(clean(), "publsh"); code != 1 {
+		t.Errorf("unknown command exited %d", code)
+	}
+	recs = s.records()
+	if len(recs) != 5 || recs[3].Command != "boom" || recs[3].Exit != 2 || recs[4].Command != "publsh" || recs[4].Exit != 1 {
+		t.Errorf("%+v", recs)
 	}
 }

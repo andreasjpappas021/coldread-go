@@ -70,6 +70,7 @@ func app(ran *[]string) *cli.Command {
 }
 
 func TestInstrument(t *testing.T) {
+	t.Setenv("COLDREAD_VERIFY", "1") // a test binary sends only when verifying, never to production
 	for _, c := range []struct {
 		args    []string
 		command string
@@ -106,14 +107,21 @@ func TestExecute(t *testing.T) {
 			{Name: "ok", Action: func(context.Context, *cli.Command) error { return nil }},
 			{Name: "coded", Action: func(context.Context, *cli.Command) error { return cli.Exit("coded failure", 3) }},
 			{Name: "plain", Action: func(context.Context, *cli.Command) error { return errors.New("plain failure") }},
+			{Name: "boom", Action: func(context.Context, *cli.Command) error { var m map[string]int; m["x"] = 1; return nil }},
+			{Name: "need", Flags: []cli.Flag{&cli.StringFlag{Name: "region", Required: true}}, Action: func(context.Context, *cli.Command) error { return nil }},
+			{Name: "env", Commands: []*cli.Command{{Name: "show", Flags: []cli.Flag{&cli.BoolFlag{Name: "all"}}, Action: func(context.Context, *cli.Command) error { return nil }}}},
 		}}
-		crurfave.Execute(context.Background(), cr, root, []string{"acme", mode})
+		crurfave.Execute(context.Background(), cr, root, append([]string{"acme"}, strings.Fields(mode)...))
 		return
 	}
 	s := newServer(t)
-	for mode, want := range map[string]int{"ok": 0, "coded": 3, "plain": 1} {
+	for mode, want := range map[string]int{
+		"ok": 0, "coded": 3, "plain": 1, "boom": 2,
+		"ok --nosuch": 1, "nosuch": 3, "need": 1, "env show --bogus": 1, "--help": 0, "ok --help": 0,
+		"help": 0, "h": 0, "help ok": 0, "env help": 0, "env": 0,
+	} {
 		cmd := exec.Command(os.Args[0], "-test.run=^TestExecute$")
-		cmd.Env = append(os.Environ(), "CRURFAVE_CHILD="+mode, "COLDREAD_ENDPOINT="+s.URL, "XDG_CACHE_HOME="+t.TempDir())
+		cmd.Env = append(os.Environ(), "CRURFAVE_CHILD="+mode, "COLDREAD_ENDPOINT="+s.URL, "XDG_CACHE_HOME="+t.TempDir(), "COLDREAD_VERIFY=1")
 		out, err := cmd.CombinedOutput()
 		code := 0
 		var exit *exec.ExitError
@@ -128,7 +136,15 @@ func TestExecute(t *testing.T) {
 	for _, r := range s.recs {
 		got[r.Command] = r.Exit
 	}
-	if len(got) != 3 || got["ok"] != 0 || got["coded"] != 3 || got["plain"] != 1 {
-		t.Fatalf("sent %+v", s.recs)
+	// Refused command lines: the code the process exits with.
+	want := map[string]int{"ok": 1, "coded": 3, "plain": 1, "boom": 2, "nosuch": 3, "need": 1, "env show": 1}
+	// "ok" ran clean once and was refused once (--nosuch): the last one wins in the map.
+	for c, code := range want {
+		if g, ok := got[c]; !ok || (c != "ok" && g != code) {
+			t.Errorf("%s: sent %v, want %d (all: %+v)", c, g, code, s.recs)
+		}
+	}
+	if len(s.recs) != 8 {
+		t.Errorf("help was sent, or a run was lost: %+v", s.recs)
 	}
 }

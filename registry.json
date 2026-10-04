@@ -4,6 +4,7 @@
     "claude-code-cli": "claude-code",
     "claudecode": "claude-code",
     "codex-cli": "codex",
+    "codex-cli-rs": "codex",
     "openai-codex": "codex",
     "gemini": "gemini-cli",
     "geminicli": "gemini-cli",
@@ -82,6 +83,7 @@
         { "env": "CODEX_SANDBOX_NETWORK_DISABLED", "when": "true", "confidence": "high" }
       ],
       "versionEnv": "CODEX_VERSION",
+      "note": "Codex sets no CODEX_VERSION, nor any variable with its version (codex-cli 0.142.5, 2026-10-03: its commands get CODEX_CI, CODEX_SANDBOX, CODEX_SANDBOX_NETWORK_DISABLED, CODEX_THREAD_ID, CODEX_MANAGED_BY_NPM, CODEX_MANAGED_PACKAGE_ROOT), so its version is null. Kept for the day it does.",
       "session": ["CODEX_THREAD_ID", "CODEX_SESSION_ID"],
       "signals": ["CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_VERSION", "CODEX_CI", "CODEX_SANDBOX_NETWORK_DISABLED"]
     },

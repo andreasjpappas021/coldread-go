@@ -33,8 +33,19 @@
 // and os, arch and Go version. Never arguments, paths, hostnames, usernames,
 // env values, a device id or anything typed. Coldread never stores the IP.
 //
+// Killed (SIGTERM, SIGHUP, SIGQUIT: what agents' timeouts send), a run is
+// recorded only when the CLI asks: catching a signal in Go turns its
+// default exit off, so Coldread never does it unasked, and by default a
+// killed run is simply not recorded. CaptureSignals (no handler of its
+// own): saved to the spool as 128+n and raised again at once. OwnSignals
+// (the CLI handles the signal itself): its handler runs as ever and the run
+// reads 128+n when it ends. Ctrl-C (SIGINT) sends nothing; SIGKILL can't be
+// seen. A refused command line is ParseError (exit
+// 2); a panic is Recover (exit 2). Help and version runs aren't sent.
+//
 // Off with DO_NOT_TRACK=1, COLDREAD_DISABLED=1 or your own OptOut, and in
-// test binaries unless COLDREAD_ENDPOINT points elsewhere. COLDREAD_DEBUG=1
+// test binaries (unless COLDREAD_VERIFY=1 to an endpoint that isn't
+// production). COLDREAD_DEBUG=1
 // prints each event to stderr and sends nothing. COLDREAD_VERIFY=1 sends
 // for real, waits, and prints what came back on stderr:
 // "[coldread] verify: accepted", or why not.
@@ -49,6 +60,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -58,6 +70,25 @@ const Version = "0.2.0"
 // DefaultEndpoint is where events go unless Options.Endpoint or
 // COLDREAD_ENDPOINT says otherwise.
 const DefaultEndpoint = "https://coldread.apappas.dev/api/ingest"
+
+// processStart is when this package was initialized, before main runs. A
+// run's duration counts from the process's start (processStarted), never
+// from New: the startup a CLI does before New counts, as the person or
+// agent waiting on it felt it.
+var processStart = time.Now()
+
+// processStarted: when this process began, as the OS says (macOS, Linux,
+// Windows), else when this package was initialized. Loading a large binary
+// and initializing the packages before this one can take tens of
+// milliseconds, all of it before package init.
+func processStarted() time.Time {
+	if t, ok := osProcessStart(); ok {
+		if before := processStart.Sub(t); before >= 0 && before < time.Hour {
+			return processStart.Add(-before) // keeps the monotonic reading
+		}
+	}
+	return processStart
+}
 
 // Options configure a Client. Key and Tool are required.
 type Options struct {
@@ -83,7 +114,26 @@ type Options struct {
 	// terminal. NoNotice turns it off.
 	Notice   string
 	NoNotice bool
+	// CaptureSignals records runs killed by SIGTERM, SIGHUP or SIGQUIT, for
+	// a CLI with no handler of its own: the run is saved to the spool as
+	// 128+n and the signal raised again at once, so the CLI dies of it as
+	// before. Off by default (Go can't tell whether anyone else listens for
+	// a signal, and catching one turns its default exit off): killed runs
+	// are then not recorded. A CLI that also handles the signal would get
+	// the raised one as a second signal: use OwnSignals there.
+	CaptureSignals bool
+	// OwnSignals records killed runs for a CLI that handles SIGTERM, SIGHUP
+	// and SIGQUIT itself (signal.Notify, signal.NotifyContext: a server, a
+	// watcher), and only then. Its handler runs as ever and ends the run
+	// (Finish, Exit); the run reads 128+n. Coldread never raises the signal
+	// again: set on a CLI without a handler, SIGTERM would no longer end it
+	// (only SIGKILL would). Finish waits 2 ms for a signal not yet read.
+	OwnSignals bool
 }
+
+// ownSignalWait: how long an OwnSignals run's Finish waits for a kill its
+// handler saw first.
+const ownSignalWait = 2 * time.Millisecond
 
 // Client reports one run of your CLI. The zero value and nil do nothing.
 type Client struct {
@@ -103,6 +153,19 @@ type Client struct {
 	command string
 	flags   []string
 	done    bool
+	// unusable: Track was given a command with nothing ingest accepts.
+	unusable bool
+	// parseFailed: ParseError named the run (exit 2, help or not).
+	parseFailed bool
+	// killedBy: the kill signal this run got (SIGTERM 15, SIGHUP 1,
+	// SIGQUIT 3), 0 for none. Its exit reads 128+n.
+	killedBy       int
+	captureSignals bool
+	ownSignals     bool
+	sigCh          chan os.Signal
+	// sigSeen: a kill signal the watcher has read (its number), before it
+	// takes the lock to note it.
+	sigSeen atomic.Int32
 }
 
 // Seams for tests; none are needed in real use.
@@ -111,6 +174,7 @@ type internals struct {
 	isTTY     *bool
 	stderrTTY *bool
 	cacheDir  string
+	tmpDir    string
 	now       func() time.Time
 	write     func(string)
 	exit      func(int)
@@ -131,8 +195,11 @@ func newClient(opts Options, in internals) (c *Client) {
 		env = environ()
 	}
 	now := in.now
+	var started time.Time
 	if now == nil {
-		now = time.Now
+		now, started = time.Now, processStarted()
+	} else {
+		started = now()
 	}
 	write := in.write
 	if write == nil {
@@ -154,7 +221,9 @@ func newClient(opts Options, in internals) (c *Client) {
 	c = &Client{
 		tool: cleanTool(opts.Tool), version: cleanVersion(opts.Version), key: opts.Key,
 		debug: env["COLDREAD_DEBUG"] == "1", verifyMode: env["COLDREAD_VERIFY"] == "1",
-		isTTY: isTTY, started: now(), now: now, write: write, exit: exit,
+		isTTY: isTTY, started: started, now: now, write: write, exit: exit,
+		ownSignals:     opts.OwnSignals,
+		captureSignals: opts.CaptureSignals,
 	}
 	endpoint := resolveEndpoint(opts.Endpoint, env)
 	c.off = disabledBy(env, opts, endpoint, testRun)
@@ -171,6 +240,11 @@ func newClient(opts Options, in internals) (c *Client) {
 		cacheDir = cacheDirFor(c.tool, env, home)
 	}
 	c.s = newSender(endpoint, c.key, "coldread-go/"+Version, filepath.Join(cacheDir, "spool.jsonl"), now)
+	tmp := in.tmpDir
+	if tmp == "" {
+		tmp = os.TempDir()
+	}
+	c.s.alt = tmpSpoolFor(c.tool, tmp)
 
 	switch {
 	case c.off != "" && c.verifyMode:
@@ -216,7 +290,13 @@ func (c *Client) Enabled() bool { return c != nil && c.off == "" && c.s != nil }
 
 // Track names the command once it's parsed: the path ("deploy preview"),
 // never argv, and flag names ("--prod"); values after = are stripped. The
-// last call before Finish wins.
+// root command itself is "" (or the tool's name): it's sent as the tool's
+// name, so a bare `acme` reads "acme". The last call before Finish wins.
+//
+// A command is up to 4 plain words; the path ends at the first part that
+// isn't one (a path, a URL, a value, something like a key). Flags are
+// `--long-name` or `-x`; anything else is dropped. COLDREAD_DEBUG=1 says
+// what was dropped.
 func (c *Client) Track(command string, flags ...string) {
 	if c == nil || c.s == nil {
 		return
@@ -227,14 +307,74 @@ func (c *Client) Track(command string, flags ...string) {
 	if c.done {
 		return
 	}
-	cleaned := cleanCommand(command)
+	cleaned, kept := c.name(command, flags)
 	if cleaned == "" {
+		c.unusable = true
 		if c.debug {
 			c.write("[coldread] track: no usable command path.\n")
 		}
 		return
 	}
-	c.command, c.flags = cleaned, cleanFlags(flags)
+	c.command, c.flags, c.unusable = cleaned, kept, false
+	c.watchSignals()
+}
+
+// name: the command and flags as kept; COLDREAD_DEBUG says what went.
+func (c *Client) name(command string, flags []string) (string, []string) {
+	cleaned, dropped := cleanCommandParts(command)
+	if jsTrim(command) == "" {
+		cleaned, dropped = c.tool, nil // the root command
+	}
+	kept, droppedFlags := cleanFlagsParts(flags)
+	if c.debug && len(dropped)+len(droppedFlags) > 0 {
+		var quoted []string
+		for _, d := range append(dropped, droppedFlags...) {
+			b, _ := json.Marshal(d)
+			quoted = append(quoted, string(b))
+		}
+		c.write("[coldread] track: dropped " + strings.Join(quoted, ", ") + " (only command words and flag names are sent).\n")
+	}
+	return cleaned, kept
+}
+
+// ParseError records a command line the parser refused (an unknown
+// command or flag, a missing or bad argument, a value that didn't
+// validate): the command that was tried (sanitised; the root when nothing
+// usable), sent when the run ends (Exit, Finish) with the code the CLI
+// exits with, or 2 if it exits 0. No command given: the one already
+// tracked, else the root.
+func (c *Client) ParseError(command string, flags ...string) {
+	if c == nil || c.s == nil {
+		return
+	}
+	func() {
+		defer func() { _ = recover() }()
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.done {
+			return
+		}
+		if jsTrim(command) != "" || c.command == "" {
+			cleaned, kept := c.name(command, flags)
+			if cleaned == "" {
+				cleaned = c.tool
+			}
+			c.command, c.flags = cleaned, kept
+		} else if len(flags) > 0 {
+			_, c.flags = c.name(c.command, flags)
+		}
+		c.unusable, c.parseFailed = false, true
+	}()
+}
+
+// Recover, deferred at the top of main (`defer cr.Recover()`), records a
+// run that panics with Go's own exit code for it, 2, then panics again, so
+// the CLI ends exactly as it would have. crcobra and crurfave do it for you.
+func (c *Client) Recover() {
+	if r := recover(); r != nil {
+		c.Finish(2)
+		panic(r)
+	}
 }
 
 // TrackFlags is Track for the standard flag package: the command, and the
@@ -248,10 +388,12 @@ func (c *Client) TrackFlags(command string, fs *flag.FlagSet) {
 	}
 	var names []string
 	fs.Visit(func(f *flag.Flag) {
+		// Names from the flag set's own definitions: lowercased, so a
+		// -baseURL reads --baseurl, never dropped.
 		if len(f.Name) == 1 {
 			names = append(names, "-"+f.Name)
 		} else {
-			names = append(names, "--"+f.Name)
+			names = append(names, "--"+strings.ToLower(f.Name))
 		}
 	})
 	c.Track(command, names...)
@@ -267,17 +409,58 @@ func (c *Client) Finish(exit int) {
 	defer func() { _ = recover() }()
 	c.mu.Lock()
 	if c.done || c.command == "" {
-		untracked := !c.done && c.command == ""
+		untracked, unusable := !c.done && c.command == "", c.unusable
 		c.mu.Unlock()
 		if untracked && c.off == "" && c.verifyMode {
-			c.write(VerifyPrefix + "nothing sent (track() was never called).\n")
+			if unusable {
+				c.write(VerifyPrefix + "nothing sent (no command).\n")
+			} else {
+				c.write(VerifyPrefix + "nothing sent (track() was never called).\n")
+			}
 		}
 		return
 	}
 	c.done = true
-	command, flags := c.command, c.flags
+	command, flags, parseFailed := c.command, c.flags, c.parseFailed
+	// A kill signal waiting to be read: the CLI's own handler is ending the
+	// run on it before our watcher got to it.
+	if c.killedBy == 0 && c.sigCh != nil {
+		select {
+		case sig := <-c.sigCh:
+			c.killedBy = signalNumber(sig)
+		default:
+			c.killedBy = int(c.sigSeen.Load()) // read by the watcher, not yet noted
+		}
+		// OwnSignals: the CLI's handler may have got the signal a moment
+		// before ours (Go hands it to each channel in turn) and be exiting
+		// already. A moment's wait makes the run read 128+n every time.
+		if c.killedBy == 0 && c.ownSignals {
+			t := time.NewTimer(ownSignalWait)
+			select {
+			case sig := <-c.sigCh:
+				c.killedBy = signalNumber(sig)
+			case <-t.C:
+				c.killedBy = int(c.sigSeen.Load())
+			}
+			t.Stop()
+		}
+	}
+	if c.killedBy != 0 {
+		exit = 128 + c.killedBy // killed, whatever it then exited with
+	} else if parseFailed && exit == 0 {
+		exit = 2 // refused, though the CLI exits 0 (cobra's help for a parent)
+	}
 	c.mu.Unlock()
+	c.unwatchSignals()
 	if c.off != "" {
+		return
+	}
+	if !parseFailed && isHelpRun(command, flags, c.tool) {
+		if c.verifyMode {
+			c.write(VerifyPrefix + "nothing sent (help or version).\n")
+		} else if c.debug {
+			c.write("[coldread] not sending (help or version).\n")
+		}
 		return
 	}
 
@@ -294,11 +477,16 @@ func (c *Client) Finish(exit int) {
 	}
 	deadline := c.now().Add(ExitWait)
 	// No network, or a recent send timed out: to the spool, no waiting.
+	// Backed off, the startup probe gets a moment first (probeAtExit): a
+	// network that works again clears the mark, and this run sends as usual.
+	if !c.det.networkDisabled && c.s.backedOff() {
+		c.s.probeAtExit(probeWait)
+	}
 	wait := !c.det.networkDisabled && !c.s.backedOff()
 	if wait {
 		c.s.sendOne(record, ExitWait)
 	} else {
-		toSpool(c.s.spool, [][]byte{record}, c.now())
+		_, _ = c.s.save([][]byte{record})
 	}
 	// The spool sent at startup gets what's left of the wait; unfinished,
 	// its events go back to the spool.
@@ -395,6 +583,12 @@ type wireRecord struct {
 	OS          string     `json:"os"`
 	Arch        string     `json:"arch"`
 	Runtime     string     `json:"runtime"`
+	// ID is made once, when the event happens: ingest stores an id once,
+	// so a resend (a POST given up on that went through) counts once.
+	ID string `json:"id,omitempty"`
+	// Verify: sent under COLDREAD_VERIFY=1, an install check, kept out of
+	// every number on the dashboard.
+	Verify bool `json:"verify,omitempty"`
 }
 
 func strOrNil(s string) *string {
@@ -435,12 +629,13 @@ func (c *Client) record(command string, flags []string, exit int) []byte {
 		Tool:    wireTool{Name: c.tool, Version: strOrNil(c.version)},
 		Command: command, Flags: flags, Exit: exit, DurationMs: d,
 		CI: c.det.ci, Interactive: c.isTTY,
-		OS: osName(), Arch: archName(), Runtime: runtimeTag(),
+		OS: osName(), Arch: archName(), Runtime: runtimeTag(), ID: newEventID(),
 	}
 	r.Agent = toWireAgent(c.det.agent)
 	if c.det.sessionID != "" {
 		r.Session = hashSession(c.det.sessionID, c.key)
 	}
+	r.Verify = c.verifyMode
 	var b bytes.Buffer
 	enc := json.NewEncoder(&b)
 	enc.SetEscapeHTML(false)
@@ -482,15 +677,17 @@ func isTestBinary() bool {
 }
 
 // disabledBy: why sending is off, or "". Checked once, at startup. A test
-// run never sends to Coldread's production endpoint.
+// run never sends (a suite runs the CLI hundreds of times), wherever the
+// endpoint points; only COLDREAD_VERIFY=1 with an endpoint other than
+// Coldread's production one does.
 func disabledBy(env map[string]string, opts Options, endpoint string, testBinary bool) (reason string) {
 	switch {
 	case truthy(env, "DO_NOT_TRACK"):
 		return "DO_NOT_TRACK"
 	case truthy(env, "COLDREAD_DISABLED"):
 		return "COLDREAD_DISABLED"
-	case endpoint == DefaultEndpoint && (testBinary || isTestRun(env)):
-		return "test run; set COLDREAD_ENDPOINT to send"
+	case (testBinary || isTestRun(env)) && !(env["COLDREAD_VERIFY"] == "1" && endpoint != DefaultEndpoint):
+		return "test run"
 	case opts.OptOut != "" && truthy(env, opts.OptOut):
 		return opts.OptOut
 	}

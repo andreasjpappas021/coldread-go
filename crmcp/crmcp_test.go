@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -90,6 +91,7 @@ func server(cr *coldread.MCP, twice bool) *mcp.Server {
 
 func newMCP(t *testing.T, in *ingest) *coldread.MCP {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("COLDREAD_VERIFY", "1") // a test binary sends only when verifying, never to production
 	// Remote: this test's own environment (maybe a coding agent's) stays out of it.
 	cr := coldread.NewMCP(coldread.MCPOptions{Key: key, Tool: "acme-mcp", Version: "1.2.0", Endpoint: in.URL + "/api/ingest", Remote: true})
 	if !cr.Enabled() {
@@ -136,6 +138,18 @@ func TestToolCallsOverStdioLikeTransport(t *testing.T) {
 	cr.Close()
 
 	recs := in.records()
+	// Verifying (as a test binary must), each call is its own POST: they
+	// can land in any order.
+	rank := map[string]int{"search_docs claude-code": 0, "deploy claude-code": 1, "raw claude-code": 2, "search_docs cursor-vscode": 3}
+	sort.SliceStable(recs, func(i, j int) bool {
+		key := func(r record) string {
+			if r.Client == nil {
+				return r.Command
+			}
+			return r.Command + " " + r.Client.Name
+		}
+		return rank[key(recs[i])] < rank[key(recs[j])]
+	})
 	if len(recs) != 4 {
 		t.Fatalf("%d records (added twice, counted once; tools/list not at all): %+v", len(recs), recs)
 	}
@@ -201,4 +215,36 @@ func TestOptedOutChangesNothing(t *testing.T) {
 	}
 	// A nil MCP is off too.
 	_, _ = crmcp.Middleware(nil)(next)(context.Background(), "tools/call", nil)
+}
+
+// A server not marked Remote, started from a Claude Code terminal, serving
+// HTTP: its calls never take the environment's agent (the operator's
+// terminal), whoever called.
+func TestHTTPCallsReadNoEnvironment(t *testing.T) {
+	in := newIngest(t)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("COLDREAD_VERIFY", "1")
+	t.Setenv("CLAUDECODE", "1")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "operator-terminal")
+	cr := coldread.NewMCP(coldread.MCPOptions{Key: key, Tool: "acme-mcp", Version: "1.2.0", Endpoint: in.URL + "/api/ingest"})
+	if cr.Agent() == nil {
+		t.Fatal("the environment should name an agent")
+	}
+	ctx := context.Background()
+	srv := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server(cr, false) }, nil))
+	defer srv.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "some-script", Version: "0.0.1"}, nil)
+	cs, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: srv.URL}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "search_docs", Arguments: map[string]any{"query": "x"}}); err != nil {
+		t.Fatal(err)
+	}
+	cs.Close()
+	cr.Close()
+	recs := in.records()
+	if len(recs) != 1 || string(recs[0].Agent) != "null" || recs[0].Client == nil || recs[0].Client.Name != "some-script" {
+		t.Fatalf("%+v %s", recs, recs[0].Agent)
+	}
 }

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -106,6 +107,7 @@ type run struct {
 	mu    sync.Mutex
 	clock *atomic.Int64 // ms
 	cache string
+	tmp   string
 	exits []int
 }
 
@@ -124,6 +126,7 @@ type setup struct {
 	isTTY     bool
 	stderrTTY bool
 	cache     string
+	tmp       string
 	testRun   bool
 	clock     bool // a fake clock (for durations); the send uses real time regardless
 }
@@ -145,7 +148,10 @@ func start(t *testing.T, s setup) *run {
 	if s.opts.Version == "" {
 		s.opts.Version = "1.2.0"
 	}
-	r := &run{cache: s.cache}
+	if s.tmp == "" {
+		s.tmp = t.TempDir()
+	}
+	r := &run{cache: s.cache, tmp: s.tmp}
 	now := time.Now
 	if s.clock {
 		r.clock = &atomic.Int64{}
@@ -153,7 +159,7 @@ func start(t *testing.T, s setup) *run {
 		now = func() time.Time { return time.UnixMilli(r.clock.Load()) }
 	}
 	r.c = newClient(s.opts, internals{
-		env: s.env, isTTY: bptr(s.isTTY), stderrTTY: bptr(s.stderrTTY), cacheDir: s.cache, now: now,
+		env: s.env, isTTY: bptr(s.isTTY), stderrTTY: bptr(s.stderrTTY), cacheDir: s.cache, tmpDir: s.tmp, now: now,
 		write:   func(l string) { r.mu.Lock(); r.out = append(r.out, l); r.mu.Unlock() },
 		exit:    func(code int) { r.exits = append(r.exits, code) },
 		testRun: bptr(s.testRun),
@@ -208,8 +214,12 @@ func TestClaudeCodeRun(t *testing.T) {
 	}
 	want := `{"source":"cli","ts":1000000000000,"tool":{"name":"acme","version":"1.2.0"},"command":"deploy preview","flags":["--prod","--token","-y"],"exit":0,"durationMs":812,` +
 		`"agent":{"name":"claude-code","raw":null,"version":"2.1.281","host":"terminal","evidence":"declared","confidence":"high","signals":["CLAUDE_CODE_CHILD_SESSION","CLAUDECODE","CLAUDE_CODE_SESSION_ID","CLAUDE_CODE_ENTRYPOINT","AI_AGENT"]},` +
-		`"ci":false,"interactive":false,"session":"` + hashSession(session, testKey) + `","os":"` + osName() + `","arch":"` + archName() + `","runtime":"` + runtimeTag() + `"}`
-	if got := string(posts[0].body.Records[0]); got != want {
+		`"ci":false,"interactive":false,"session":"` + hashSession(session, testKey) + `","os":"` + osName() + `","arch":"` + archName() + `","runtime":"` + runtimeTag() + `","id":"`
+	got := string(posts[0].body.Records[0])
+	if id := strings.TrimSuffix(strings.TrimPrefix(got, want), `"}`); len(id) != 32 || strings.Trim(id, "0123456789abcdef") != "" {
+		t.Fatalf("id %q", id)
+	}
+	if !strings.HasPrefix(got, want) {
 		t.Fatalf("record\n got %s\nwant %s", got, want)
 	}
 	if spooled(t, r.cache) != nil {
@@ -257,10 +267,78 @@ func TestNothingTrackedNothingSent(t *testing.T) {
 	r := start(t, setup{opts: Options{Endpoint: in.endpoint()}})
 	r.c.Finish(0)
 	r2 := start(t, setup{opts: Options{Endpoint: in.endpoint()}})
-	r2.c.Track("   ")
+	r2.c.Track("!!! ???")
 	r2.c.Finish(0)
 	if len(in.posts()) != 0 {
 		t.Fatal("sent")
+	}
+}
+
+// The root command (cobra's path cut to "", or a bare `acme`) is the
+// tool's name, as crcobra sends it, never dropped.
+func TestRootCommand(t *testing.T) {
+	for _, cmd := range []string{"", "   ", "acme"} {
+		in := newIngest(t)
+		r := start(t, setup{opts: Options{Endpoint: in.endpoint()}})
+		r.c.Track(cmd, "--minify")
+		r.c.Finish(0)
+		if got := in.commands(); len(got) != 1 || got[0] != "acme" {
+			t.Fatalf("Track(%q): %q", cmd, got)
+		}
+	}
+	// A later, real command wins; a bad one after a good one changes nothing.
+	in := newIngest(t)
+	r := start(t, setup{opts: Options{Endpoint: in.endpoint()}})
+	r.c.Track("")
+	r.c.Track("new site")
+	r.c.Track("!!!")
+	r.c.Finish(0)
+	if got := in.commands(); len(got) != 1 || got[0] != "new site" {
+		t.Fatalf("%q", got)
+	}
+}
+
+// Duration counts from process start (package init), not from New: a CLI's
+// own startup before New is part of what the agent waited for.
+func TestDurationFromProcessStart(t *testing.T) {
+	c := newClient(Options{Key: testKey, Tool: "acme", Version: "1"}, internals{
+		env: claudeEnv(), isTTY: bptr(false), stderrTTY: bptr(false), cacheDir: t.TempDir(), tmpDir: t.TempDir(), testRun: bptr(false),
+		write: func(string) {},
+	})
+	if c.started.After(processStart) || processStart.Sub(c.started) > time.Hour {
+		t.Fatalf("started %v, package init %v", c.started, processStart)
+	}
+	if _, ok := osProcessStart(); ok && !c.started.Before(processStart) {
+		t.Fatalf("the OS's start time wasn't used: %v", c.started)
+	}
+	time.Sleep(5 * time.Millisecond)
+	since := time.Since(c.started).Milliseconds()
+	var rec struct {
+		TS         int64
+		DurationMs int64
+	}
+	_ = json.Unmarshal(c.record("deploy", nil, 0), &rec)
+	if rec.TS != c.started.UnixMilli() || rec.DurationMs < since || rec.DurationMs < 5 {
+		t.Fatalf("record %+v, since start %dms", rec, since)
+	}
+}
+
+// The OS's start time for this process, where it's read, is before this
+// package's init and not long before.
+func TestOSProcessStart(t *testing.T) {
+	st, ok := osProcessStart()
+	switch runtime.GOOS {
+	case "darwin", "linux", "windows":
+		if !ok {
+			t.Fatal("not read")
+		}
+	default:
+		if !ok {
+			t.Skip("not read on " + runtime.GOOS)
+		}
+	}
+	if before := processStart.Sub(st); before < 0 || before > time.Minute {
+		t.Fatalf("process start %v, package init %v", st, processStart)
 	}
 }
 
@@ -376,8 +454,20 @@ func TestTestRunsNeverSendToProduction(t *testing.T) {
 	if start(t, setup{testRun: true}).c.Enabled() {
 		t.Error("a go test binary is enabled")
 	}
-	if !start(t, setup{testRun: true, env: with(claudeEnv(), "COLDREAD_ENDPOINT", "http://127.0.0.1:9/i")}).c.Enabled() {
-		t.Error("another endpoint is muted")
+	// A suite running a CLI whose code names an endpoint (vfox's added 26
+	// rows during an install): muted all the same.
+	if start(t, setup{testRun: true, env: with(claudeEnv(), "COLDREAD_ENDPOINT", "http://127.0.0.1:9/i")}).c.Enabled() {
+		t.Error("another endpoint sends from a test binary")
+	}
+	if start(t, setup{testRun: true, opts: Options{Endpoint: "http://127.0.0.1:9/i"}}).c.Enabled() {
+		t.Error("an Endpoint option sends from a test binary")
+	}
+	// Only COLDREAD_VERIFY=1, and never to production.
+	if !start(t, setup{testRun: true, env: with(claudeEnv(), "COLDREAD_VERIFY", "1"), opts: Options{Endpoint: "http://127.0.0.1:9/i"}}).c.Enabled() {
+		t.Error("a verify run to another endpoint is muted")
+	}
+	if start(t, setup{testRun: true, env: with(claudeEnv(), "COLDREAD_VERIFY", "1")}).c.Enabled() {
+		t.Error("a verify run from a test binary would reach production")
 	}
 	// This very test binary, on the real environment.
 	os.Unsetenv("COLDREAD_ENDPOINT")
@@ -402,7 +492,7 @@ func TestDebugPrintsAndSendsNothing(t *testing.T) {
 	}
 	r3 := start(t, setup{env: with(claudeEnv(), "COLDREAD_DEBUG", "1"), opts: Options{Endpoint: in.endpoint()}})
 	r3.c.Track("!!!")
-	if got := r3.lines(); len(got) != 1 || got[0] != "[coldread] track: no usable command path.\n" {
+	if got := r3.lines(); len(got) != 2 || got[0] != "[coldread] track: dropped \"!!!\" (only command words and flag names are sent).\n" || got[1] != "[coldread] track: no usable command path.\n" {
 		t.Fatalf("%q", got)
 	}
 }
@@ -426,6 +516,13 @@ func TestVerifyLines(t *testing.T) {
 			t.Errorf("got %q, want %q", got, want)
 		}
 	}
+	// A line that names the spool it saved to.
+	checkSaved := func(prefix string, got []string) {
+		t.Helper()
+		if len(got) != 1 || !strings.HasPrefix(got[0], prefix+" (") || !strings.HasSuffix(got[0], string(filepath.Separator)+"spool.jsonl).\n") {
+			t.Errorf("got %q, want %q (<spool>).", got, prefix)
+		}
+	}
 	check(VerifyAccepted, verifyLine(t, in, claudeEnv(), Options{}))
 	in.set(202, `{"accepted":0,"rejected":[{"i":0,"error":"tool.name: invalid"}]}`)
 	check("[coldread] verify: rejected (202: tool.name: invalid)", verifyLine(t, in, claudeEnv(), Options{}))
@@ -434,15 +531,15 @@ func TestVerifyLines(t *testing.T) {
 	in.set(400, `not json`)
 	check("[coldread] verify: rejected (400)", verifyLine(t, in, claudeEnv(), Options{}))
 	in.set(503, `{}`)
-	check("[coldread] verify: not sent (503); saved for the next run.", verifyLine(t, in, claudeEnv(), Options{}))
+	checkSaved("[coldread] verify: not sent (503); saved for the next run", verifyLine(t, in, claudeEnv(), Options{}))
 
 	l, _ := net.Listen("tcp", "127.0.0.1:0")
 	closed := "http://" + l.Addr().String() + "/api/ingest"
 	l.Close()
-	check("[coldread] verify: not sent (ECONNREFUSED); saved for the next run.", verifyLine(t, in, claudeEnv(), Options{Endpoint: closed}))
+	checkSaved("[coldread] verify: not sent (ECONNREFUSED); saved for the next run", verifyLine(t, in, claudeEnv(), Options{Endpoint: closed}))
 
 	before := len(in.posts())
-	check("[coldread] verify: no network here; saved for the next run with network.", verifyLine(t, in, map[string]string{"CODEX_THREAD_ID": "x", "CODEX_SANDBOX_NETWORK_DISABLED": "1"}, Options{}))
+	checkSaved("[coldread] verify: no network here; saved for the next run with network", verifyLine(t, in, map[string]string{"CODEX_THREAD_ID": "x", "CODEX_SANDBOX_NETWORK_DISABLED": "1"}, Options{}))
 	if len(in.posts()) != before {
 		t.Error("sent without network")
 	}
@@ -452,6 +549,10 @@ func TestVerifyLines(t *testing.T) {
 	r := start(t, setup{env: with(claudeEnv(), "COLDREAD_VERIFY", "1"), opts: Options{Endpoint: in.endpoint()}})
 	r.c.Finish(0)
 	check("[coldread] verify: nothing sent (track() was never called).", r.lines())
+	r = start(t, setup{env: with(claudeEnv(), "COLDREAD_VERIFY", "1"), opts: Options{Endpoint: in.endpoint()}})
+	r.c.Track("!!!")
+	r.c.Finish(0)
+	check("[coldread] verify: nothing sent (no command).", r.lines())
 
 	// Off by default: nothing printed.
 	in.set(401, `{"error":"Unknown or revoked key."}`)
@@ -585,7 +686,7 @@ func TestCleaning(t *testing.T) {
 		`run "rm -rf"`:              "run",
 		strings.Repeat("a", 200):    "",
 		"":                          "",
-		strings.Repeat("word ", 40): strings.TrimSpace(strings.Repeat("word ", 25)),
+		strings.Repeat("word ", 40): "word word word word", // 4 parts at most
 	} {
 		if got := cleanCommand(in); got != want {
 			t.Errorf("cleanCommand(%q) = %q", in, got)

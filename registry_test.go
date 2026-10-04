@@ -143,9 +143,41 @@ func TestParityCases(t *testing.T) {
 			} `json:"in"`
 			Want string `json:"want"`
 		} `json:"formatAgentHeader"`
+		CleanCommand []struct {
+			In   string  `json:"in"`
+			Want *string `json:"want"`
+		} `json:"cleanCommand"`
+		CleanFlags []struct {
+			In   []string `json:"in"`
+			Want []string `json:"want"`
+		} `json:"cleanFlags"`
+		IsHelpRun []struct {
+			Command string   `json:"command"`
+			Flags   []string `json:"flags"`
+			Tool    string   `json:"tool"`
+			Want    bool     `json:"want"`
+		} `json:"isHelpRun"`
 	}
 	if err := json.Unmarshal(mustRead(t, "testdata/parity.json"), &cases); err != nil {
 		t.Fatal(err)
+	}
+	if len(cases.CleanCommand) == 0 || len(cases.CleanFlags) == 0 || len(cases.IsHelpRun) == 0 {
+		t.Fatal("no clean cases")
+	}
+	for _, c := range cases.CleanCommand {
+		if got := cleanCommand(c.In); got != deref(c.Want) {
+			t.Errorf("cleanCommand(%q) = %q, want %q", c.In, got, deref(c.Want))
+		}
+	}
+	for _, c := range cases.CleanFlags {
+		if got := cleanFlags(c.In); !reflect.DeepEqual(got, c.Want) {
+			t.Errorf("cleanFlags(%q) = %q, want %q", c.In, got, c.Want)
+		}
+	}
+	for _, c := range cases.IsHelpRun {
+		if got := isHelpRun(c.Command, c.Flags, c.Tool); got != c.Want {
+			t.Errorf("isHelpRun(%q, %q, %q) = %v, want %v", c.Command, c.Flags, c.Tool, got, c.Want)
+		}
 	}
 	if len(cases.Detect) == 0 || len(cases.Normalize) == 0 || len(cases.ParseAgentID) == 0 || len(cases.AgentFromProcess) == 0 || len(cases.FormatAgentHeader) == 0 || len(cases.MCPClientAgent) == 0 || len(cases.People) == 0 {
 		t.Fatal("no cases")

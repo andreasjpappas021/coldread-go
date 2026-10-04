@@ -3,7 +3,7 @@ module coldread.apappas.dev/go/crmcpgo
 go 1.23.0
 
 require (
-	coldread.apappas.dev/go v0.2.0
+	coldread.apappas.dev/go v0.3.0
 	github.com/mark3labs/mcp-go v0.43.1
 )
 

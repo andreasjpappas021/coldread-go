@@ -77,7 +77,9 @@ func main() {
 }
 ```
 
-`Execute` tracks the command cobra ran (`deploy preview`) with the flags set on it, and exits: 0, or 1 on an error.
+`Execute` tracks the command cobra ran (`deploy preview`, or the tool's name for the root command) with the flags set on it, and exits: 0, or 1 on an error.
+
+A framework that wraps cobra (bep/simplecobra) or your own executor: after it runs, `crcobra.Track(cr, cmd)` with the `*cobra.Command` that ran, then `cr.Exit(code)`.
 
 ## CLI: urfave/cli v3
 
@@ -102,13 +104,15 @@ cr.TrackFlags("deploy", flag.CommandLine) // or cr.Track("deploy preview", "--pr
 cr.Exit(code)
 ```
 
+The root command itself: `cr.Track("")` (sent as the tool's name).
+
 ## CLI exit codes
 
 `os.Exit` skips everything, so the send can't hook it. Exit with `cr.Exit(code)` instead, or call `cr.Finish(code)` before main returns. The helpers do it for you. A command that calls `os.Exit`, `log.Fatal` or `cobra.CheckErr` itself exits before anything is sent: return an error instead.
 
 ## CLI speed
 
-The connection opens in the background at startup, and what earlier runs couldn't send goes then too. At exit the send waits 300 ms at most (`coldread.ExitWait`); what isn't through by then waits on disk (`~/.cache/coldread/<tool>/spool.jsonl`, the same spool `@coldread/cli` uses) for the next run. After a send times out, runs skip that wait for 10 minutes and only the background send tries, so a network that drops packets costs one command 300 ms, not every command.
+The connection opens in the background at startup, and what earlier runs couldn't send goes then too. At exit the send waits 300 ms at most (`coldread.ExitWait`); what isn't through by then waits on disk (`~/.cache/coldread/<tool>/spool.jsonl`, the same spool `@coldread/cli` uses) for the next run. Where the cache can't be written (Codex's sandbox), it waits in the temp folder (`$TMPDIR/coldread-<uid>/<tool>/spool.jsonl`), and the next run with network sends both. Durations count from process start (package init), not from `New`. After a send times out, runs skip that wait for 10 minutes and only the background send tries, so a network that drops packets costs one command 300 ms, not every command.
 
 ## CLI: also
 
@@ -128,7 +132,7 @@ The connection opens in the background at startup, and what earlier runs couldn'
 ## Telemetry
 
 Acme sends anonymous usage data to its developers through Coldread: which
-command ran (or MCP tool was called), its flag names, exit code and duration,
+command ran, its flag names, exit code and duration,
 whether an AI coding agent ran it and which one, and your OS and architecture.
 Never arguments, flag values, file paths, your hostname or username, or
 anything you type. Your IP address is not stored.

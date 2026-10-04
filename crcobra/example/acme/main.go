@@ -50,8 +50,9 @@ func main() {
 	preview.Flags().String("token", "", "API token")
 	status := &cobra.Command{Use: "status", RunE: func(*cobra.Command, []string) error { return nil }}
 	fail := &cobra.Command{Use: "fail", RunE: func(*cobra.Command, []string) error { return errors.New("it failed") }}
+	boom := &cobra.Command{Use: "boom", RunE: func(*cobra.Command, []string) error { var m map[string]int; m["x"] = 1; return nil }}
 	deploy.AddCommand(preview)
-	root.AddCommand(deploy, status, fail)
+	root.AddCommand(deploy, status, fail, boom)
 
 	crcobra.Execute(cr, root)
 }

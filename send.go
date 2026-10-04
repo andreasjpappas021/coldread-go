@@ -3,7 +3,9 @@ package coldread
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,7 +15,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -30,14 +35,22 @@ import (
 //     answered in time, a network error, 429 or 5xx: the event goes to the
 //     spool, and the next run sends it in the background. The startup send
 //     gets what's left of the same wait; unfinished, its events go back.
-//  3. A send that timed out leaves a mark (<cache>/backoff) for 10 minutes:
-//     a network that drops packets would otherwise cost every command the
-//     whole wait. Marked, runs spool at exit without waiting and only the
-//     background send tries; any answer from Coldread clears the mark.
+//  3. A send that timed out without ever reaching Coldread (no connection
+//     opened in this run) leaves a mark (<cache>/backoff) for 10 minutes: a
+//     network that drops packets would otherwise cost every command the
+//     whole wait. A slow answer over a connection that did open is just
+//     latency (120 ms away, a cold TLS send takes longer than the wait), and
+//     leaves no mark. Marked, runs spool at exit without waiting; the
+//     background send at startup still runs, and its connection is the
+//     probe: once one opens, or Coldread answers anything, the mark goes and
+//     that same run waits at exit as usual.
 //
 // The spool is @coldread/cli's, same file and format: one JSON event per
-// line in <cache>/spool.jsonl, the newest 100 within 64 KB, nothing older
-// than 7 days. One POST is at most 8 KB.
+// line in <cache>/spool.jsonl, the newest 100 within 64 KB (past that, the
+// oldest go first), nothing older than 7 days. One POST is at most 8 KB. Where the cache can't be written
+// (Codex's sandbox allows only the workspace and the temp folder), events
+// wait in the temp folder instead (<tmp>/coldread-<uid>/<tool>/spool.jsonl),
+// and every send takes them from both.
 
 const (
 	maxPostBytes   = 8192
@@ -70,9 +83,15 @@ type sender struct {
 	key      string
 	ua       string
 	spool    string
-	backoff  string // "" for an MCP server, which never waits at exit
-	now      func() time.Time
-	client   *http.Client
+	// alt is the temp folder's spool, for when spool's folder can't be
+	// written. "" for none.
+	alt     string
+	backoff string // "" for an MCP server, which never waits at exit
+	now     func() time.Time
+	client  *http.Client
+	// reached: a connection to Coldread opened in this run. A timeout after
+	// that is latency, not a network that drops packets.
+	reached atomic.Bool
 
 	// The startup send: what it claimed, and whether it (or Finish, handing
 	// its events back) has settled them.
@@ -99,13 +118,13 @@ func newSender(endpoint, key, ua, spool string, now func() time.Time) *sender {
 			if c := s.takeWarm(ctx, addr); c != nil {
 				return c, nil
 			}
-			return dialer.DialContext(ctx, network, addr)
+			return s.connected(dialer.DialContext(ctx, network, addr))
 		},
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			if c := s.takeWarm(ctx, addr); c != nil {
 				return c, nil
 			}
-			return tlsDialer.DialContext(ctx, network, addr)
+			return s.connected(tlsDialer.DialContext(ctx, network, addr))
 		},
 		TLSHandshakeTimeout: sendTimeout,
 		MaxIdleConns:        2,
@@ -120,6 +139,15 @@ func newSender(endpoint, key, ua, spool string, now func() time.Time) *sender {
 }
 
 var errRedirect = errors.New("redirect")
+
+// connected notes that a connection to Coldread opened: the network works,
+// so any backoff mark goes.
+func (s *sender) connected(c net.Conn, err error) (net.Conn, error) {
+	if err == nil && !s.reached.Swap(true) {
+		s.clearSlow()
+	}
+	return c, err
+}
 
 // prewarm opens the connection the send will use, in the background. Not
 // through a proxy (the transport dials the proxy itself), and never twice.
@@ -159,7 +187,41 @@ func (s *sender) prewarm() {
 			s.warmConn, s.warmAt = c, s.now()
 		}
 		s.warmMu.Unlock()
+		// The probe: connected, the network works, and the mark goes before
+		// this run's exit decides whether to wait.
+		_, _ = s.connected(c, err)
 	}()
+}
+
+// probeWait: how long a backed-off run's exit waits for its startup probe.
+// Only a network that still drops packets pays it.
+const probeWait = 50 * time.Millisecond
+
+// probeAtExit waits up to d for the startup probe to connect (which clears
+// the backoff mark); a run with no probe (behind a proxy) dials once.
+func (s *sender) probeAtExit(d time.Duration) {
+	s.warmMu.Lock()
+	ready, addr := s.warmReady, s.warmAddr
+	s.warmMu.Unlock()
+	if ready != nil {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-ready:
+		case <-t.C:
+		}
+		return
+	}
+	u, err := url.Parse(s.endpoint)
+	if err != nil || u.Hostname() == "" {
+		return
+	}
+	if addr = u.Host; u.Port() == "" {
+		addr = net.JoinHostPort(u.Hostname(), map[string]string{"https": "443", "http": "80"}[u.Scheme])
+	}
+	if c, err := s.connected((&net.Dialer{Timeout: d}).Dial("tcp", addr)); err == nil {
+		c.Close()
+	}
 }
 
 // takeWarm hands the startup connection to the first request for its
@@ -210,7 +272,7 @@ func (s *sender) post(ctx context.Context, records [][]byte) (reply, error) {
 	req.Header.Set("User-Agent", s.ua)
 	res, err := s.client.Do(req)
 	if err != nil {
-		if why(err) == "timed out" {
+		if why(err) == "timed out" && !s.reached.Load() {
 			s.markSlow()
 		}
 		return reply{}, err
@@ -368,12 +430,13 @@ func readSpool(file string, now time.Time) [][]byte {
 }
 
 // toSpool adds events to the spool, keeping the newest that fit its caps.
-func toSpool(file string, records [][]byte, now time.Time) {
+// The error says why they couldn't be written.
+func toSpool(file string, records [][]byte, now time.Time) error {
 	if len(records) == 0 {
-		return
+		return nil
 	}
-	if os.MkdirAll(filepath.Dir(file), 0o700) != nil {
-		return
+	if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
+		return err
 	}
 	add := 0
 	for _, r := range records {
@@ -393,16 +456,18 @@ func toSpool(file string, records [][]byte, now time.Time) {
 	if size+int64(add) <= maxSpoolBytes && count+len(records) <= maxSpoolEvents {
 		f, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
-			return
+			return err
 		}
-		defer f.Close()
 		var b bytes.Buffer
 		for _, r := range records {
 			b.Write(r)
 			b.WriteByte('\n')
 		}
-		_, _ = f.Write(b.Bytes())
-		return
+		_, err = f.Write(b.Bytes())
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		return err
 	}
 	// Over a cap: keep the newest that fit.
 	all := append(readSpool(file, now), records...)
@@ -422,16 +487,152 @@ func toSpool(file string, records [][]byte, now time.Time) {
 		b.WriteByte('\n')
 	}
 	tmp := fmt.Sprintf("%s.%d.tmp", file, os.Getpid())
-	if os.WriteFile(tmp, b.Bytes(), 0o600) == nil {
-		if os.Rename(tmp, file) != nil {
-			os.Remove(tmp)
+	if err := os.WriteFile(tmp, b.Bytes(), 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, file); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// newEventID: 16 random bytes, hex, made once per event.
+func newEventID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b)
+}
+
+// withKey: the event as the spool keeps it, with the key it was made with
+// (k, never sent): it's only ever sent with that key. One that has its k
+// already keeps it.
+func withKey(record []byte, key string) []byte {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(record, &obj) != nil {
+		return record
+	}
+	if _, ok := obj["k"]; ok {
+		return record
+	}
+	k, _ := json.Marshal(key)
+	obj["k"] = k
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return record
+	}
+	return out
+}
+
+// spooled: the claimed events made with this sender's key, without their
+// k, ready to send. Events made with another key go back to the spool
+// untouched, for a run that has it (a week at most).
+func (s *sender) spooled(files []string, now time.Time) [][]byte {
+	var mine, theirs [][]byte
+	for _, r := range readClaimed(files, now) {
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(r, &obj) != nil {
+			continue
+		}
+		if raw, ok := obj["k"]; ok {
+			var k string
+			if json.Unmarshal(raw, &k) == nil && k != s.key {
+				theirs = append(theirs, r)
+				continue
+			}
+			delete(obj, "k")
+			if out, err := json.Marshal(obj); err == nil {
+				r = out
+			}
+		}
+		mine = append(mine, r)
+	}
+	if len(theirs) > 0 {
+		_, _ = s.save(theirs)
+	}
+	return mine
+}
+
+// save puts events in the spool, else in the temp folder's, each with the
+// key it was made with. It returns the file they went to, or why the spool
+// couldn't take them.
+func (s *sender) save(records [][]byte) (string, error) {
+	if len(records) == 0 {
+		return "", nil
+	}
+	tagged := make([][]byte, len(records))
+	for i, r := range records {
+		tagged[i] = withKey(r, s.key)
+	}
+	records = tagged
+	err := toSpool(s.spool, records, s.now())
+	if err == nil {
+		return s.spool, nil
+	}
+	if s.alt == "" || privateDir(tmpTop(s.alt), true) != nil {
+		return "", err
+	}
+	if toSpool(s.alt, records, s.now()) != nil {
+		return "", err
+	}
+	return s.alt, nil
+}
+
+// claim takes both spools for this process (claimSpool); the temp folder's
+// only while its folder is this user's own.
+func (s *sender) claim(now time.Time) []string {
+	claimed := claimSpool(s.spool, now)
+	if s.alt != "" && privateDir(tmpTop(s.alt), false) == nil {
+		claimed = append(claimed, claimSpool(s.alt, now)...)
+	}
+	return claimed
+}
+
+// tmpTop: <tmp>/coldread-<uid> for <tmp>/coldread-<uid>/<tool>/spool.jsonl.
+func tmpTop(alt string) string { return filepath.Dir(filepath.Dir(alt)) }
+
+// tmpSpoolFor: a tool's spool in the temp folder. Per user, since the temp
+// folder can be shared (/tmp on Linux).
+func tmpSpoolFor(tool, tmp string) string {
+	top := "coldread"
+	if uid := os.Getuid(); uid >= 0 {
+		top = fmt.Sprintf("coldread-%d", uid)
+	}
+	return filepath.Join(tmp, top, cacheName(tool), "spool.jsonl")
+}
+
+// saveWhy names why events couldn't be written: EPERM, EACCES, EROFS, or
+// the message.
+func saveWhy(err error) string {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		if name, ok := saveErrnos[errno]; ok {
+			return name
 		}
 	}
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		err = pe.Err
+	}
+	return jsSlice(err.Error(), 100)
+}
+
+var saveErrnos = map[syscall.Errno]string{
+	syscall.EACCES:  "EACCES",
+	syscall.EPERM:   "EPERM",
+	syscall.EROFS:   "EROFS",
+	syscall.ENOSPC:  "ENOSPC",
+	syscall.ENOENT:  "ENOENT",
+	syscall.ENOTDIR: "ENOTDIR",
 }
 
 // claimSpool takes the spool for this process by renaming it (atomic: of
 // two runs at once, one gets it), plus any claim a run left behind when it
-// exited mid-send. Returns the claimed files.
+// exited mid-send: at once when the process that made it is gone (a server
+// killed mid-send: Codex's stdin EOF then SIGTERM), after staleClaim while
+// it's alive (it may still be sending). Returns the claimed files.
 func claimSpool(file string, now time.Time) []string {
 	var claimed []string
 	mine := func() string {
@@ -446,7 +647,7 @@ func claimSpool(file string, now time.Time) []string {
 			continue
 		}
 		st, err := os.Stat(o)
-		if err != nil || now.Sub(st.ModTime()) < staleClaim {
+		if err != nil || (now.Sub(st.ModTime()) < staleClaim && !processGone(claimPID(file, o))) {
 			continue
 		}
 		if name := mine(); os.Rename(o, name) == nil {
@@ -454,6 +655,20 @@ func claimSpool(file string, now time.Time) []string {
 		}
 	}
 	return claimed
+}
+
+// claimPID: the pid in a claim's name (<spool>.<pid>.<...>.sending, as
+// every SDK names them), 0 when there isn't one.
+func claimPID(file, claim string) int {
+	rest := strings.TrimPrefix(claim, file+".")
+	if rest == claim {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.SplitN(rest, ".", 2)[0])
+	if err != nil || pid == os.Getpid() {
+		return 0
+	}
+	return pid
 }
 
 func contains(list []string, s string) bool {
@@ -487,13 +702,13 @@ func (s *sender) drain() {
 		return
 	}
 	now := s.now()
-	s.drainClaimed = claimSpool(s.spool, now)
+	s.drainClaimed = s.claim(now)
 	if len(s.drainClaimed) == 0 {
 		s.drainDone = true
 		s.drainMu.Unlock()
 		return
 	}
-	s.drainRecords = readClaimed(s.drainClaimed, now)
+	s.drainRecords = s.spooled(s.drainClaimed, now)
 	claimed := s.drainClaimed
 	batch, rest := fit(s.drainRecords)
 	s.drainMu.Unlock()
@@ -512,7 +727,7 @@ func (s *sender) drain() {
 	if retry {
 		rest = append(batch, rest...)
 	}
-	toSpool(s.spool, rest, s.now())
+	_, _ = s.save(rest)
 	removeAll(claimed)
 }
 
@@ -526,7 +741,7 @@ func (s *sender) abandonDrain() {
 		return
 	}
 	s.drainDone = true
-	toSpool(s.spool, s.drainRecords, s.now())
+	_, _ = s.save(s.drainRecords)
 	removeAll(s.drainClaimed)
 }
 
@@ -544,7 +759,7 @@ func (s *sender) sendOne(record []byte, deadline time.Duration) {
 		}
 		resolved = true
 		if spool {
-			toSpool(s.spool, [][]byte{record}, s.now())
+			_, _ = s.save([][]byte{record})
 		}
 	}
 	done := make(chan struct{})
@@ -558,48 +773,60 @@ func (s *sender) sendOne(record []byte, deadline time.Duration) {
 	select {
 	case <-done:
 	case <-t.C:
-		s.markSlow()
+		if !s.reached.Load() {
+			s.markSlow() // never connected: the network drops packets
+		}
 		resolve(true)
 	}
 }
 
 // verify is COLDREAD_VERIFY=1: this run's event and the spool in one POST,
-// waited for, and one line on stderr saying what came back.
+// waited for, and one line on stderr saying what came back and, for an
+// event that wasn't sent, where it waits (or why it couldn't).
 func (s *sender) verify(record []byte, offline bool, say func(string)) {
 	now := s.now()
 	if offline {
-		toSpool(s.spool, [][]byte{record}, now)
-		say("no network here; saved for the next run with network.")
+		where, err := s.save([][]byte{record})
+		if err != nil {
+			say("no network here; not saved (" + saveWhy(err) + "), so this event is lost.")
+			return
+		}
+		say("no network here; saved for the next run with network (" + where + ").")
 		return
 	}
-	claimed := claimSpool(s.spool, now)
-	spooled := readClaimed(claimed, now)
+	claimed := s.claim(now)
+	spooled := s.spooled(claimed, now)
 	removeAll(claimed)
 	batch, rest := fit(append([][]byte{record}, spooled...))
 	if len(batch) == 0 {
-		toSpool(s.spool, rest, now)
+		_, _ = s.save(rest)
 		say("not sent (the event is over 8 KB).")
 		return
 	}
 	r, err := s.post(context.Background(), batch)
 	if err != nil {
-		toSpool(s.spool, append(batch, rest...), s.now())
-		say("not sent (" + why(err) + "); saved for the next run.")
+		say("not sent (" + why(err) + "); " + saved(s.save(append(batch, rest...))))
 		return
 	}
 	if r.retry() {
-		toSpool(s.spool, append(batch, rest...), s.now())
-	} else {
-		toSpool(s.spool, rest, s.now())
+		say(fmt.Sprintf("not sent (%d); %s", r.status, saved(s.save(append(batch, rest...)))))
+		return
 	}
+	_, _ = s.save(rest)
 	switch {
 	case r.status >= 200 && r.status < 300 && r.accepted > 0:
 		say("accepted")
-	case r.retry():
-		say(fmt.Sprintf("not sent (%d); saved for the next run.", r.status))
 	case r.why != "":
 		say(fmt.Sprintf("rejected (%d: %s)", r.status, r.why))
 	default:
 		say(fmt.Sprintf("rejected (%d)", r.status))
 	}
+}
+
+// saved ends a verify line for an event left for the next run.
+func saved(where string, err error) string {
+	if err != nil {
+		return "not saved (" + saveWhy(err) + "), so this event is lost."
+	}
+	return "saved for the next run (" + where + ")."
 }
