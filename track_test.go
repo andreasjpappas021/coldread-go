@@ -137,7 +137,7 @@ func TestAgentsGoWholePeopleAsCounts(t *testing.T) {
 	for i := 0; i < 30; i++ {
 		get(t, srv, paths[i%3]+"?utm=x", person)
 	}
-	bot := map[string]string{"User-Agent": gptbot, "Accept": "*/*", "Cookie": "a=b", "Authorization": "Bearer hunter2", "X-Secret": "nope", "Cf-Connecting-Ip": "20.171.207.130", "X-Real-Ip": "10.0.0.1"}
+	bot := map[string]string{"User-Agent": gptbot, "Accept": "*/*", "Cookie": "a=b", "Authorization": "Bearer hunter2", "X-Secret": "nope", "Cf-Connecting-Ip": "20.171.207.130", "X-Real-Ip": "10.0.0.1"} // forged: the connection's address goes
 	if s := get(t, srv, "/pricing?utm=x#top", bot); s != 200 {
 		t.Fatal(s)
 	}
@@ -173,7 +173,7 @@ func TestAgentsGoWholePeopleAsCounts(t *testing.T) {
 		t.Fatalf("whole %+v", whole)
 	}
 	first := whole[0]
-	if first.Path != "/pricing" || first.Status != 200 || first.IP != "20.171.207.130" || first.Host != strings.TrimPrefix(srv.URL, "http://") || first.Method != "GET" {
+	if first.Path != "/pricing" || first.Status != 200 || first.IP != "127.0.0.1" || first.Host != strings.TrimPrefix(srv.URL, "http://") || first.Method != "GET" {
 		t.Errorf("bot record %+v", first)
 	}
 	if !reflect.DeepEqual(first.Headers, map[string]string{"user-agent": gptbot, "accept": "*/*"}) {
@@ -329,14 +329,15 @@ func TestStreamingAndHijackStillWork(t *testing.T) {
 }
 
 func TestClientIP(t *testing.T) {
+	t.Setenv("COLDREAD_TRUST_PROXY", "")
+	t.Setenv("VERCEL", "")
 	for _, c := range []struct {
 		h      map[string]string
 		remote string
 		want   string
 	}{
-		{map[string]string{"Cf-Connecting-Ip": "1.1.1.1", "X-Real-Ip": "2.2.2.2", "X-Forwarded-For": "3.3.3.3"}, "4.4.4.4:5", "1.1.1.1"},
-		{map[string]string{"X-Real-Ip": "2.2.2.2", "X-Forwarded-For": "3.3.3.3, 9.9.9.9"}, "4.4.4.4:5", "2.2.2.2"},
-		{map[string]string{"X-Forwarded-For": " 3.3.3.3 , 9.9.9.9"}, "4.4.4.4:5", "3.3.3.3"},
+		// A visitor can write any header: a forged address never wins over the connection's.
+		{map[string]string{"Cf-Connecting-Ip": "66.249.66.1", "X-Real-Ip": "2.2.2.2", "X-Forwarded-For": "3.3.3.3"}, "4.4.4.4:5", "4.4.4.4"},
 		{nil, "4.4.4.4:5", "4.4.4.4"},
 		{nil, "[2001:db8::1]:443", "2001:db8::1"},
 	} {
@@ -349,10 +350,72 @@ func TestClientIP(t *testing.T) {
 			t.Errorf("ClientIP(%v, %s) = %s, want %s", c.h, c.remote, got, c.want)
 		}
 	}
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.2:5"
+	r.Header.Set("X-Forwarded-For", "66.249.66.1, 3.3.3.3")
+	t.Setenv("COLDREAD_TRUST_PROXY", "1")
+	if got := ClientIP(r); got != "3.3.3.3" {
+		t.Errorf("trusted: %s", got)
+	}
+
+	// TrustProxy, the option.
+	t.Setenv("COLDREAD_TRUST_PROXY", "")
+	trusting, _ := testTracker(t, "http://127.0.0.1:1/api/ingest", TrackerOptions{FlushInterval: time.Hour, People: "full", TrustProxy: 2}, nil)
+	trusting.Middleware(http.NotFoundHandler()).ServeHTTP(httptest.NewRecorder(), r)
+	if got := queued(trusting)[0].(*httpRecord); got.IP != "66.249.66.1" {
+		t.Errorf("%+v", got)
+	}
+	plain, _ := testTracker(t, "http://127.0.0.1:1/api/ingest", TrackerOptions{FlushInterval: time.Hour, People: "full"}, nil)
+	plain.Middleware(http.NotFoundHandler()).ServeHTTP(httptest.NewRecorder(), r)
+	if got := queued(plain)[0].(*httpRecord); got.IP != "10.0.0.2" {
+		t.Errorf("%+v", got)
+	}
+
+	// The shared cases.
+	var cases struct {
+		ClientIP []struct {
+			Headers    map[string]string `json:"headers"`
+			Peer       *string           `json:"peer"`
+			TrustProxy int               `json:"trustProxy"`
+			Vercel     bool              `json:"vercel"`
+			Want       *string           `json:"want"`
+		} `json:"clientIp"`
+		Hops []struct {
+			In   any `json:"in"`
+			Want int `json:"want"`
+		} `json:"trustProxyHops"`
+	}
+	if err := json.Unmarshal(mustRead(t, "testdata/parity.json"), &cases); err != nil {
+		t.Fatal(err)
+	}
+	if len(cases.ClientIP) < 5 || len(cases.Hops) < 5 {
+		t.Fatal("no cases")
+	}
+	for _, c := range cases.ClientIP {
+		h := http.Header{}
+		for k, v := range c.Headers {
+			h.Set(k, v)
+		}
+		peer, want := "", ""
+		if c.Peer != nil {
+			peer = *c.Peer
+		}
+		if c.Want != nil {
+			want = *c.Want
+		}
+		if got := clientIP(h, peer, c.TrustProxy, c.Vercel); got != want {
+			t.Errorf("clientIP(%+v) = %q, want %q", c, got, want)
+		}
+	}
+	for _, c := range cases.Hops {
+		if got := trustProxyHops(c.In); got != c.Want {
+			t.Errorf("trustProxyHops(%#v) = %d, want %d", c.In, got, c.Want)
+		}
+	}
 
 	// The IP option, for hosts that put it elsewhere.
 	tr, _ := testTracker(t, "http://127.0.0.1:1/api/ingest", TrackerOptions{FlushInterval: time.Hour, People: "full", IP: func(r *http.Request) string { return r.Header.Get("Fly-Client-Ip") }}, nil)
-	r := httptest.NewRequest("GET", "/", nil)
+	r = httptest.NewRequest("GET", "/", nil)
 	r.Header.Set("Fly-Client-Ip", "5.5.5.5")
 	r.Header.Set("Cf-Connecting-Ip", "1.1.1.1")
 	r.Header.Set("X-Forwarded-Host", "Example.COM")
@@ -591,8 +654,35 @@ func TestRateLimitedPausesAsAsked(t *testing.T) {
 	in.set(429, `{"error":"slow down"}`)
 	tr, out := testTracker(t, in.endpoint(), TrackerOptions{}, nil)
 	send(t, tr)
-	if p := pausedFor(tr); p < 50*time.Second || p > 61*time.Second || len(out.all()) != 0 {
+	if p := pausedFor(tr); p < 50*time.Second || p > 61*time.Second {
 		t.Errorf("paused %s, %q", p, out.all())
+	}
+	// Round 5: what a pause drops is said, once per cause.
+	for i := 0; i < 50; i++ {
+		tr.Track(bot())
+	}
+	if s := tr.Stats(); s.Dropped != 51 || !reflect.DeepEqual(out.all(), []string{"[coldread] dropped 1 record (paused after 429)."}) {
+		t.Errorf("%+v %q", s, out.all())
+	}
+}
+
+func TestDropsAreNeverSilent(t *testing.T) {
+	in := newIngest(t)
+	in.set(503, "")
+	tr, out := testTracker(t, in.endpoint(), TrackerOptions{FlushInterval: time.Hour}, nil)
+	tr.Track(bot())
+	tr.Track(bot())
+	tr.Flush(context.Background())
+	tr.Track(bot())
+	if !reflect.DeepEqual(out.all(), []string{"[coldread] dropped 2 records (paused after HTTP 503)."}) {
+		t.Errorf("%q", out.all())
+	}
+	full, out2 := testTracker(t, "http://127.0.0.1:1/api/ingest", TrackerOptions{FlushInterval: time.Hour, MaxQueue: 3}, nil)
+	for i := 0; i < 10; i++ {
+		full.Track(bot())
+	}
+	if s := full.Stats(); s.Dropped != 7 || !reflect.DeepEqual(out2.all(), []string{"[coldread] dropped 1 record (queue full)."}) {
+		t.Errorf("%+v %q", s, out2.all())
 	}
 }
 

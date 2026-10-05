@@ -109,6 +109,10 @@ func (c *Client) killed(n int) {
 		c.write(VerifyPrefix + "killed (exit " + strconv.Itoa(128+n) + "); saved for the next run.\n")
 	}
 	if !c.debug || c.verifyMode {
-		_, _ = c.s.save([][]byte{record})
+		records := [][]byte{record}
+		if rules := c.rulesToSend(); rules != nil {
+			records = append(records, rules)
+		}
+		_, _ = c.s.save(records)
 	}
 }

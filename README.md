@@ -14,14 +14,14 @@ Go 1.21+. No dependencies; the MCP helpers are their own modules.
 
 ```go
 tr := coldread.NewTracker(coldread.TrackerOptions{}) // COLDREAD_KEY from env
-defer tr.Close()                                     // sends what's queued
 http.ListenAndServe(":8080", tr.Middleware(mux))
 ```
 
 - chi: `r.Use(tr.Middleware)`. gin, echo, gorilla/mux: `tr.Middleware(router)` where the server is made.
-- Graceful shutdown: `tr.Close()` after `srv.Shutdown(ctx)`.
+- Graceful shutdown: `tr.Close()` once `srv.Shutdown(ctx)` returns (sends what's queued, people's counts too). Never after `ListenAndServe`, which returns as soon as Shutdown starts.
 - Not `net/http` (Fiber): `tr.Track(coldread.RequestFacts{...})` once each response is sent.
-- IP: `cf-connecting-ip`, `x-real-ip`, the first `x-forwarded-for`, then the connection; `TrackerOptions.IP` for anything else.
+- IP: the connection's (Vercel's `x-real-ip` on Vercel): any visitor can write headers. Behind proxies you control that add to `X-Forwarded-For`: `TrustProxy: 1` (how many) or `COLDREAD_TRUST_PROXY=1`. `TrackerOptions.IP` for anything else.
+- Drops (a full queue, a pause after a 429 or 5xx) are logged once per cause.
 - Sent: method, path (no query string), status, IP, host, and `user-agent`, `accept`, `accept-language`, `sec-fetch-dest`, `sec-ch-ua*`, `signature*`, `ai-agent`. Never cookies, auth, other headers or bodies. People's page views go as counts per path and minute (`People: "full"` sends them whole).
 - Never delays a response: a goroutine sends batches (2s or 100 requests); when Coldread is down, batches are dropped with backoff, never retried.
 - Verify: stderr says `[coldread] connected: first requests accepted` once Coldread accepts the first batch.
@@ -109,6 +109,8 @@ The root command itself: `cr.Track("")` (sent as the tool's name).
 ## CLI exit codes
 
 `os.Exit` skips everything, so the send can't hook it. Exit with `cr.Exit(code)` instead, or call `cr.Finish(code)` before main returns. The helpers do it for you. A command that calls `os.Exit`, `log.Fatal` or `cobra.CheckErr` itself exits before anything is sent: return an error instead.
+
+A non-zero exit your tool documents as a normal result (issues found): `Expected: map[string][]int{"detect": {1}}` (the root as `""`). Sent once; those runs never count as failures.
 
 ## CLI speed
 

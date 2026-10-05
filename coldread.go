@@ -65,7 +65,7 @@ import (
 )
 
 // Version is this SDK's version.
-const Version = "0.2.0"
+const Version = "0.3.1"
 
 // DefaultEndpoint is where events go unless Options.Endpoint or
 // COLDREAD_ENDPOINT says otherwise.
@@ -129,6 +129,13 @@ type Options struct {
 	// again: set on a CLI without a handler, SIGTERM would no longer end it
 	// (only SIGKILL would). Finish waits 2 ms for a signal not yet read.
 	OwnSignals bool
+	// Expected: exit codes that are a normal result, not a failure, by
+	// command path: {"detect": {1}} for a scanner that exits 1 when it
+	// finds something. The root command is "" (or the tool's name). Codes
+	// 1-255. Sent once (again only when it changes) and kept as the site's
+	// expected outcomes, so those runs never count as dead ends. Only what
+	// your tool documents.
+	Expected map[string][]int
 }
 
 // ownSignalWait: how long an OwnSignals run's Finish waits for a kill its
@@ -148,6 +155,8 @@ type Client struct {
 	exit               func(int)
 	s                  *sender
 	drained            chan struct{}
+	cacheDir           string
+	expected           map[string][]int
 
 	mu      sync.Mutex
 	command string
@@ -239,6 +248,8 @@ func newClient(opts Options, in internals) (c *Client) {
 		home, _ := os.UserHomeDir()
 		cacheDir = cacheDirFor(c.tool, env, home)
 	}
+	c.cacheDir = cacheDir
+	c.expected = cleanExpected(opts.Expected, c.tool)
 	c.s = newSender(endpoint, c.key, "coldread-go/"+Version, filepath.Join(cacheDir, "spool.jsonl"), now)
 	tmp := in.tmpDir
 	if tmp == "" {
@@ -468,8 +479,15 @@ func (c *Client) Finish(exit int) {
 	if c.debug {
 		c.write("[coldread] " + string(record) + "\n")
 	}
+	records := [][]byte{record}
+	if rules := c.rulesToSend(); rules != nil {
+		if c.debug {
+			c.write("[coldread] " + string(rules) + "\n")
+		}
+		records = append(records, rules)
+	}
 	if c.verifyMode {
-		c.s.verify(record, c.det.networkDisabled, func(m string) { c.write(VerifyPrefix + m + "\n") })
+		c.s.verifyAll(records, c.det.networkDisabled, func(m string) { c.write(VerifyPrefix + m + "\n") })
 		return
 	}
 	if c.debug {
@@ -484,9 +502,9 @@ func (c *Client) Finish(exit int) {
 	}
 	wait := !c.det.networkDisabled && !c.s.backedOff()
 	if wait {
-		c.s.sendOne(record, ExitWait)
+		c.s.sendAll(records, ExitWait)
 	} else {
-		_, _ = c.s.save([][]byte{record})
+		_, _ = c.s.save(records)
 	}
 	// The spool sent at startup gets what's left of the wait; unfinished,
 	// its events go back to the spool.

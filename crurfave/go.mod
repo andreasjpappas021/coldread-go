@@ -3,7 +3,7 @@ module coldread.apappas.dev/go/crurfave
 go 1.22
 
 require (
-	coldread.apappas.dev/go v0.3.0
+	coldread.apappas.dev/go v0.3.1
 	github.com/urfave/cli/v3 v3.1.0
 )
 

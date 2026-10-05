@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -255,6 +256,8 @@ type reply struct {
 	status   int
 	accepted int
 	why      string
+	// refused: the records ingest rejected, by index in the batch, and why.
+	refused map[int]string
 }
 
 // post sends one batch. err is a network error (or a timeout); otherwise the
@@ -286,6 +289,7 @@ func (s *sender) post(ctx context.Context, records [][]byte) (reply, error) {
 		Accepted *float64 `json:"accepted"`
 		Error    *string  `json:"error"`
 		Rejected []struct {
+			I     int    `json:"i"`
 			Error string `json:"error"`
 		} `json:"rejected"`
 	}
@@ -297,6 +301,12 @@ func (s *sender) post(ctx context.Context, records [][]byte) (reply, error) {
 			r.why = *parsed.Error
 		} else if len(parsed.Rejected) > 0 {
 			r.why = parsed.Rejected[0].Error
+		}
+		for _, x := range parsed.Rejected {
+			if r.refused == nil {
+				r.refused = map[int]string{}
+			}
+			r.refused[x.I] = x.Error
 		}
 	}
 	r.why = jsSlice(r.why, 200)
@@ -749,6 +759,12 @@ func (s *sender) abandonDrain() {
 // isn't sent by then is spooled; the POST, if it is still going, is left to
 // finish or die with the process.
 func (s *sender) sendOne(record []byte, deadline time.Duration) {
+	s.sendAll([][]byte{record}, deadline)
+}
+
+// sendAll is sendOne for this run's records (its event, then the expected
+// exits when it carries them), in one POST.
+func (s *sender) sendAll(records [][]byte, deadline time.Duration) {
 	var mu sync.Mutex
 	resolved := false
 	resolve := func(spool bool) {
@@ -759,13 +775,13 @@ func (s *sender) sendOne(record []byte, deadline time.Duration) {
 		}
 		resolved = true
 		if spool {
-			_, _ = s.save([][]byte{record})
+			_, _ = s.save(records)
 		}
 	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		r, err := s.post(context.Background(), [][]byte{record})
+		r, err := s.post(context.Background(), records)
 		resolve(err != nil || r.retry())
 	}()
 	t := time.NewTimer(deadline)
@@ -784,9 +800,15 @@ func (s *sender) sendOne(record []byte, deadline time.Duration) {
 // waited for, and one line on stderr saying what came back and, for an
 // event that wasn't sent, where it waits (or why it couldn't).
 func (s *sender) verify(record []byte, offline bool, say func(string)) {
+	s.verifyAll([][]byte{record}, offline, say)
+}
+
+// verifyAll is verify for this run's records: its event, then the expected
+// exits when it carries them, which get a line of their own.
+func (s *sender) verifyAll(records [][]byte, offline bool, say func(string)) {
 	now := s.now()
 	if offline {
-		where, err := s.save([][]byte{record})
+		where, err := s.save(records)
 		if err != nil {
 			say("no network here; not saved (" + saveWhy(err) + "), so this event is lost.")
 			return
@@ -797,7 +819,7 @@ func (s *sender) verify(record []byte, offline bool, say func(string)) {
 	claimed := s.claim(now)
 	spooled := s.spooled(claimed, now)
 	removeAll(claimed)
-	batch, rest := fit(append([][]byte{record}, spooled...))
+	batch, rest := fit(append(append([][]byte{}, records...), spooled...))
 	if len(batch) == 0 {
 		_, _ = s.save(rest)
 		say("not sent (the event is over 8 KB).")
@@ -820,6 +842,35 @@ func (s *sender) verify(record []byte, offline bool, say func(string)) {
 		say(fmt.Sprintf("rejected (%d: %s)", r.status, r.why))
 	default:
 		say(fmt.Sprintf("rejected (%d)", r.status))
+	}
+	// The expected exits, when this POST carried them: their own line.
+	for i, rec := range batch {
+		var rr struct {
+			Source   string           `json:"source"`
+			Expected map[string][]int `json:"expected"`
+		}
+		if json.Unmarshal(rec, &rr) != nil || rr.Source != "rules" {
+			continue
+		}
+		if why, no := r.refused[i]; no {
+			say("expected exits rejected (" + jsSlice(why, 200) + ")")
+		} else if r.status >= 200 && r.status < 300 {
+			places := make([]string, 0, len(rr.Expected))
+			for p := range rr.Expected {
+				places = append(places, p)
+			}
+			sort.Strings(places)
+			parts := make([]string, 0, len(places))
+			for _, p := range places {
+				codes := make([]string, 0, len(rr.Expected[p]))
+				for _, c := range rr.Expected[p] {
+					codes = append(codes, strconv.Itoa(c))
+				}
+				parts = append(parts, p+": "+strings.Join(codes, ", "))
+			}
+			say("expected exits accepted (" + strings.Join(parts, "; ") + ")")
+		}
+		break
 	}
 }
 

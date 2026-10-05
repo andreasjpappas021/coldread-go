@@ -54,11 +54,17 @@ func looksSecret(part string) bool {
 var (
 	addrV4Re = regexp.MustCompile(`^[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?::[0-9]+)?$`)
 	addrV6Re = regexp.MustCompile(`^[0-9A-Fa-f:.]+$`)
+	// A segment after a colon that is a word: no digits, and either no
+	// capitals or camelCase (starts lowercase, every capital followed by a
+	// lowercase letter).
+	colonWordRe = regexp.MustCompile(`^(?:[a-z._-]+(?:[A-Z][a-z][a-z._-]*)*)?$`)
 )
 
 // looksAddress: an address or a credential pair rather than a word: IPv4
 // (with or without a port), IPv6, host:port, or x:y whose part after a
-// colon has a digit or a capital letter.
+// colon isn't a lowercase or camelCase word (a digit, a leading capital,
+// capitals in a row): migrate:currentVersion is a word, user:Pass and
+// admin:hunter2 aren't.
 func looksAddress(part string) bool {
 	if addrV4Re.MatchString(part) {
 		return true
@@ -67,7 +73,7 @@ func looksAddress(part string) bool {
 		return true
 	}
 	for _, s := range strings.Split(part, ":")[1:] {
-		if strings.ContainsAny(s, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+		if !colonWordRe.MatchString(s) {
 			return true
 		}
 	}

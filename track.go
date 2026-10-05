@@ -86,9 +86,15 @@ type TrackerOptions struct {
 	// People is "count" (the default: people's page views go as counts,
 	// never their IP or headers) or "full" (every request is sent whole).
 	People string
+	// TrustProxy is how many proxies you control sit in front of the app,
+	// each adding the address it saw to X-Forwarded-For (nginx, a load
+	// balancer, Cloudflare in front of your server). The visitor is the
+	// entry that many from the end. 0 reads COLDREAD_TRUST_PROXY; unset or
+	// negative, no header is trusted and the address is the connection's:
+	// a visitor can write any header, Google's address included.
+	TrustProxy int
 	// IP returns the visitor's address when your host puts it somewhere
-	// other than cf-connecting-ip, x-real-ip, x-forwarded-for or the
-	// connection (e.g. Fly's fly-client-ip).
+	// else (e.g. Fly's fly-client-ip).
 	IP func(*http.Request) string
 }
 
@@ -125,6 +131,8 @@ type Tracker struct {
 	timeout       time.Duration
 	countPeople   bool
 	ip            func(*http.Request) string
+	trustProxy    int
+	vercel        bool
 	enabled       bool
 	now           func() time.Time
 	write         func(string)
@@ -142,9 +150,12 @@ type Tracker struct {
 	inFlight   bool
 	closed     bool
 	pausedTill time.Time
-	failures   int
-	stats      TrackerStats
-	warned     map[string]bool
+	// pausedFor says why sending is paused, for the line that says records
+	// were dropped; "" when the pause's own line already said it.
+	pausedFor string
+	failures  int
+	stats     TrackerStats
+	warned    map[string]bool
 }
 
 type countKey struct {
@@ -213,6 +224,11 @@ func newTracker(opts TrackerOptions, in trackerInternals) *Tracker {
 	if t.key == "" {
 		t.key = env["COLDREAD_KEY"]
 	}
+	t.trustProxy = opts.TrustProxy
+	if t.trustProxy == 0 {
+		t.trustProxy = trustProxyHops(env["COLDREAD_TRUST_PROXY"])
+	}
+	t.vercel = env["VERCEL"] != ""
 	if t.flushInterval <= 0 {
 		t.flushInterval = 2 * time.Second
 	}
@@ -327,7 +343,7 @@ func (t *Tracker) factsOf(r *http.Request) (f RequestFacts, ok bool) {
 	if t.ip != nil {
 		ip = t.ip(r)
 	} else {
-		ip = ClientIP(r)
+		ip = clientIP(r.Header, peerOf(r.RemoteAddr), t.trustProxy, t.vercel)
 	}
 	host := r.Header.Get("X-Forwarded-Host")
 	if host == "" {
@@ -336,25 +352,80 @@ func (t *Tracker) factsOf(r *http.Request) (f RequestFacts, ok bool) {
 	return RequestFacts{Method: r.Method, URL: url, Header: r.Header, IP: ip, Host: host, Time: t.now()}, true
 }
 
-// ClientIP is the visitor's address as Middleware reads it: Cloudflare's
-// cf-connecting-ip, then x-real-ip, the first x-forwarded-for, then the
-// connection's own address. Only trust the headers if your proxy sets them.
+// ClientIP is the visitor's address as Middleware reads it by default:
+// Vercel's x-real-ip on Vercel, X-Forwarded-For only when
+// COLDREAD_TRUST_PROXY says proxies of yours add to it, else the
+// connection's own address. Headers are anyone's to send: a visitor can put
+// Google's address in cf-connecting-ip and pass as Googlebot, so none is
+// read unless something you run sets it.
 func ClientIP(r *http.Request) string {
-	if v := r.Header.Get("Cf-Connecting-Ip"); v != "" {
-		return v
+	return clientIP(r.Header, peerOf(r.RemoteAddr), trustProxyHops(os.Getenv("COLDREAD_TRUST_PROXY")), os.Getenv("VERCEL") != "")
+}
+
+// clientIP: x-real-ip on Vercel (Vercel sets it over the visitor's);
+// behind hops proxies of yours, the X-Forwarded-For entry hops from the
+// end (the address your outermost proxy saw; the first one when there are
+// fewer), else x-real-ip; otherwise peer. The shared cases (parity.json:
+// clientIp) pin it to @coldread/track's and coldread-sdk's.
+func clientIP(h http.Header, peer string, hops int, vercel bool) string {
+	one := func(name string) string { return jsTrim(strings.SplitN(headerValue(h, name), ",", 2)[0]) }
+	if vercel {
+		if v := one("x-real-ip"); v != "" {
+			return v
+		}
+		return peer
 	}
-	if v := r.Header.Get("X-Real-Ip"); v != "" {
-		return v
-	}
-	if v := r.Header.Get("X-Forwarded-For"); v != "" {
-		if first := jsTrim(strings.SplitN(v, ",", 2)[0]); first != "" {
-			return first
+	if hops > 0 {
+		var chain []string
+		for _, p := range strings.Split(headerValue(h, "x-forwarded-for"), ",") {
+			if p = jsTrim(p); p != "" {
+				chain = append(chain, p)
+			}
+		}
+		if len(chain) > 0 {
+			return chain[max(0, len(chain)-hops)]
+		}
+		if v := one("x-real-ip"); v != "" {
+			return v
 		}
 	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+	return peer
+}
+
+// peerOf is the connection's address without its port.
+func peerOf(remote string) string {
+	if host, _, err := net.SplitHostPort(remote); err == nil {
 		return host
 	}
-	return r.RemoteAddr
+	return remote
+}
+
+// trustProxyHops reads COLDREAD_TRUST_PROXY: a count ("1", "2"), or
+// "true"/"yes"/"on" for one. Anything else is none.
+func trustProxyHops(v any) int {
+	switch x := v.(type) {
+	case bool:
+		if x {
+			return 1
+		}
+	case int:
+		if x > 0 {
+			return min(x, 10)
+		}
+	case float64:
+		if x > 0 && x == float64(int(x)) {
+			return min(int(x), 10)
+		}
+	case string:
+		t := strings.ToLower(jsTrim(x))
+		if n, err := strconv.Atoi(t); err == nil && len(t) <= 3 && t[0] != '-' && t[0] != '+' {
+			return max(0, min(n, 10))
+		}
+		if t == "true" || t == "yes" || t == "on" {
+			return 1
+		}
+	}
+	return 0
 }
 
 // --- the response's status ---
@@ -545,12 +616,21 @@ func (t *Tracker) Track(f RequestFacts) {
 	defer func() { _ = recover() }() // tracking never breaks a response
 	now := t.now()
 	t.mu.Lock()
-	if t.closed || now.Before(t.pausedTill) || len(t.queue) >= t.maxQueue {
+	dropped := true
+	switch {
+	case t.closed:
 		t.stats.Dropped++
-		t.mu.Unlock()
-		return
+	case now.Before(t.pausedTill):
+		t.drop(1, 1, t.pauseCause())
+	case len(t.queue) >= t.maxQueue:
+		t.drop(1, 1, "queue full")
+	default:
+		dropped = false
 	}
 	t.mu.Unlock()
+	if dropped {
+		return
+	}
 	rec := toRecord(f, now)
 	verdict := verdictSend
 	if rec != nil && t.countPeople {
@@ -583,7 +663,7 @@ func (t *Tracker) Track(f RequestFacts) {
 
 func (t *Tracker) enqueue(r any, now time.Time) {
 	if len(t.queue) >= t.maxQueue {
-		t.stats.Dropped += weight(r)
+		t.drop(1, weight(r), "queue full")
 		return
 	}
 	if len(t.queue) == 0 {
@@ -680,9 +760,11 @@ func (t *Tracker) run() {
 			t.sleep(left)
 		}
 		if t.now().Before(t.pausedTill) {
+			total := 0
 			for _, r := range t.queue {
-				t.stats.Dropped += weight(r)
+				total += weight(r)
 			}
+			t.drop(len(t.queue), total, t.pauseCause())
 			t.queue = nil
 			t.broadcast()
 			continue
@@ -760,21 +842,42 @@ func (t *Tracker) warn(id, message string) {
 	t.write("[coldread] " + message + "\n")
 }
 
-func (t *Tracker) pause(d time.Duration) {
+func (t *Tracker) pause(d time.Duration, why string) {
 	if until := t.now().Add(d); until.After(t.pausedTill) {
 		t.pausedTill = until
 	}
+	t.pausedFor = why
+}
+
+// drop counts records lost to a full queue or a pause (requests, as Stats
+// counts) and says so once per cause, so a drop is never silent.
+func (t *Tracker) drop(records, requests int, cause string) {
+	t.stats.Dropped += requests
+	if records > 0 && cause != "" {
+		s := "s"
+		if records == 1 {
+			s = ""
+		}
+		t.warn("dropped:"+cause, fmt.Sprintf("dropped %d record%s (%s).", records, s, cause))
+	}
+}
+
+func (t *Tracker) pauseCause() string {
+	if t.pausedFor == "" {
+		return ""
+	}
+	return "paused after " + t.pausedFor
 }
 
 // backoff: no retries. A failed batch is dropped and sending pauses, 1s
 // doubling to a minute.
-func (t *Tracker) backoff() {
+func (t *Tracker) backoff(why string) {
 	t.failures++
 	d := time.Minute
 	if t.failures <= 7 {
 		d = min(time.Minute, time.Second<<(t.failures-1))
 	}
-	t.pause(d)
+	t.pause(d, why)
 }
 
 var connectedSaid atomic.Bool
@@ -815,7 +918,7 @@ func (t *Tracker) post(records []any) {
 		}
 		t.mu.Lock()
 		t.stats.Dropped += total
-		t.backoff()
+		t.backoff("")
 		t.warn("net:"+cause, fmt.Sprintf("couldn't reach %s (%s); retrying with the next requests.", t.endpoint, cause))
 		t.mu.Unlock()
 		return
@@ -830,7 +933,7 @@ func (t *Tracker) post(records []any) {
 	switch {
 	case status >= 300 && status < 400:
 		t.stats.Dropped += total
-		t.backoff()
+		t.backoff("")
 		t.warn("redirect", "the endpoint redirected; not following it.")
 	case status >= 200 && status < 300:
 		t.failures = 0
@@ -864,7 +967,7 @@ func (t *Tracker) post(records []any) {
 		ctype := res.Header.Get("Content-Type")
 		switch {
 		case auth && errorIn(ctype, raw) != "":
-			t.pause(10 * time.Minute)
+			t.pause(10*time.Minute, "")
 			t.warn("auth", fmt.Sprintf("key rejected (%s); paused 10 minutes.", errorIn(ctype, raw)))
 		case auth:
 			// Coldread always names its error, as JSON; anything else (a
@@ -874,16 +977,20 @@ func (t *Tracker) post(records []any) {
 			if kind == "" {
 				kind = "no content type"
 			}
-			t.backoff()
+			t.backoff("")
 			t.warn(fmt.Sprintf("blocked:%d", status), fmt.Sprintf("blocked before reaching Coldread (HTTP %d, %s; a firewall or bot challenge?). Not a key problem.", status, kind))
 		case status == 429:
 			after, err := strconv.ParseFloat(strings.TrimSpace(res.Header.Get("Retry-After")), 64)
 			if err != nil || after == 0 {
 				after = 60
 			}
-			t.pause(time.Duration(max(0, min(after, 300)) * float64(time.Second)))
+			t.pause(time.Duration(max(0, min(after, 300))*float64(time.Second)), "429")
+			t.stats.Dropped -= total
+			t.drop(len(records), total, "paused after 429")
 		case status >= 500:
-			t.backoff()
+			t.backoff(fmt.Sprintf("HTTP %d", status))
+			t.stats.Dropped -= total
+			t.drop(len(records), total, fmt.Sprintf("paused after HTTP %d", status))
 		default:
 			t.warn(fmt.Sprintf("status:%d", status), fmt.Sprintf("batch refused (%d).", status))
 		}

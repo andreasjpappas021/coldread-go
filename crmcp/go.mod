@@ -3,7 +3,7 @@ module coldread.apappas.dev/go/crmcp
 go 1.23.0
 
 require (
-	coldread.apappas.dev/go v0.3.0
+	coldread.apappas.dev/go v0.3.1
 	github.com/modelcontextprotocol/go-sdk v1.0.0
 )
 
